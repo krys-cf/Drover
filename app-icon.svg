@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#0f0f1a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed background (macOS applies its own squircle mask) -->
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- Title bar background -->
+  <rect x="0" y="0" width="1024" height="146" fill="#16161e"/>
+  <!-- Title bar bottom border -->
+  <line x1="0" y1="146" x2="1024" y2="146" stroke="#2a2a3c" stroke-width="2"/>
+
+  <!-- Traffic light dots -->
+  <circle cx="120" cy="76" r="24" fill="#ff5f57"/>
+  <circle cx="192" cy="76" r="24" fill="#febc2e"/>
+  <circle cx="264" cy="76" r="24" fill="#28c840"/>
+
+  <!-- Title bar text -->
+  <text x="512" y="90" font-family="SF Pro, -apple-system, Helvetica Neue, sans-serif" font-size="44" font-weight="500" fill="#6a6a80" text-anchor="middle">drover</text>
+
+  <!-- Prompt line -->
+  <text x="120" y="380" font-family="SF Mono, Menlo, Consolas, monospace" font-size="120" font-weight="700" fill="#8888a0">❯</text>
+  <text x="240" y="380" font-family="SF Mono, Menlo, Consolas, monospace" font-size="112" font-weight="600" fill="#e4e4ed" letter-spacing="4">drover</text>
+
+  <!-- Cursor block -->
+  <rect x="120" y="430" width="64" height="10" rx="5" ry="5" fill="#8888a0" opacity="0.8"/>
+
+  <!-- Faint output lines (decorative) -->
+  <rect x="120" y="520" width="480" height="8" rx="4" fill="#2a2a3c" opacity="0.6"/>
+  <rect x="120" y="560" width="340" height="8" rx="4" fill="#2a2a3c" opacity="0.4"/>
+  <rect x="120" y="600" width="560" height="8" rx="4" fill="#2a2a3c" opacity="0.3"/>
+  <rect x="120" y="640" width="260" height="8" rx="4" fill="#2a2a3c" opacity="0.2"/>
+
+  <!-- Second prompt (faint, below output) -->
+  <text x="120" y="760" font-family="SF Mono, Menlo, Consolas, monospace" font-size="80" font-weight="700" fill="#8888a0" opacity="0.4">❯</text>
+  <rect x="230" y="740" width="48" height="8" rx="4" fill="#8888a0" opacity="0.3"/>
+</svg>
