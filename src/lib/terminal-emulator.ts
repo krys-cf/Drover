@@ -110,6 +110,7 @@ export class TerminalEmulator {
   onTuiModeChange?: (active: boolean) => void;
   onBell?: () => void;
   onTitleChange?: (title: string) => void;
+  onCwdChange?: (cwd: string) => void;
 
   // Current terminal title (set by TUI apps via OSC)
   title = '';
@@ -628,6 +629,17 @@ export class TerminalEmulator {
       case 2: // Set window title
         this.title = value;
         this.onTitleChange?.(value);
+        break;
+      case 7: // Current working directory (file://host/path)
+        try {
+          const url = new URL(value);
+          if (url.protocol === 'file:') {
+            let path = decodeURIComponent(url.pathname);
+            // On Windows, pathname starts with /C:/... — strip leading slash
+            if (/^\/[A-Za-z]:\//.test(path)) path = path.substring(1);
+            this.onCwdChange?.(path);
+          }
+        } catch { /* ignore malformed URLs */ }
         break;
     }
   }

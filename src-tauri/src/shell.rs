@@ -40,11 +40,27 @@ pub fn spawn_shell(
     #[cfg(unix)]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     #[cfg(windows)]
-    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let shell = "powershell.exe".to_string();
 
     let mut cmd = CommandBuilder::new(&shell);
     #[cfg(unix)]
     cmd.arg("-l");
+    #[cfg(windows)]
+    {
+        cmd.arg("-NoLogo");
+        cmd.arg("-NoExit");
+        cmd.arg("-Command");
+        // Override prompt to emit OSC 7 with the current directory so the
+        // frontend can track cwd changes in real time.
+        cmd.arg(concat!(
+            "function prompt {",
+            " $e=[char]27; $b=[char]7;",
+            " $p=$PWD.Path.Replace('\\','/');",
+            " \"$e]7;file://localhost/$p$b\"",
+            " + \"PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) \"",
+            " }"
+        ));
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("LANG", "en_US.UTF-8");
     #[cfg(unix)]
@@ -176,10 +192,12 @@ fn replace_home_prefix(path: &str) -> String {
             return "~".to_string();
         }
         if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
-            return format!("~{rest}");
+            let result = format!("~{rest}");
+            // Normalize to forward slashes for consistent frontend handling
+            return result.replace('\\', "/");
         }
     }
-    path.to_string()
+    path.replace('\\', "/")
 }
 
 #[cfg(unix)]
@@ -202,11 +220,12 @@ fn get_process_cwd(pid: u32) -> Result<String, String> {
 
 #[cfg(windows)]
 fn get_process_cwd(pid: u32) -> Result<String, String> {
-    use sysinfo::{Pid, System};
+    use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
     let mut sys = System::new();
-    sys.refresh_processes(
+    sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
         true,
+        ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
     );
     if let Some(proc) = sys.process(Pid::from_u32(pid)) {
         if let Some(cwd) = proc.cwd() {

@@ -4,14 +4,15 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { load } from '@tauri-apps/plugin-store';
   import { Client, Stronghold } from '@tauri-apps/plugin-stronghold';
-  import { appDataDir } from '@tauri-apps/api/path';
+  import { appDataDir, homeDir as getHomeDir } from '@tauri-apps/api/path';
   import { TerminalEmulator, keyToSequence, encodeMouseEvent, type CellStyle } from '$lib/terminal-emulator';
   import { TerminalCanvas } from '$lib/terminal-canvas';
-  import { THEMES, applyThemeCssVars, highlightPrompt as themeHighlightPrompt, highlightOutput, type TerminalTheme } from '$lib/theme';
+  import { THEMES, applyThemeCssVars, highlightPrompt as themeHighlightPrompt, isBarePrompt, highlightOutput, type TerminalTheme } from '$lib/theme';
   import type { FileEntry } from '$lib/types';
   import SettingsPage from '$lib/components/SettingsPage.svelte';
   import EditorView from '$lib/components/EditorView.svelte';
   import MarkdownPreview from '$lib/components/MarkdownPreview.svelte';
+  import { renderMarkdown } from '$lib/markdown';
   import FileExplorer from '$lib/components/FileExplorer.svelte';
   import DigApp from '$lib/components/DigApp.svelte';
   import CurlApp from '$lib/components/CurlApp.svelte';
@@ -26,6 +27,48 @@
 
   let charWidth = 7.22;
   let charHeight = 16;
+
+  type DesktopPlatform = 'macos' | 'windows' | 'linux' | 'unknown';
+  let desktopPlatform = $state<DesktopPlatform>('unknown');
+
+  function detectDesktopPlatform(): DesktopPlatform {
+    if (typeof navigator === 'undefined') return 'unknown';
+
+    const rawPlatform = (
+      (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ||
+      navigator.platform ||
+      navigator.userAgent ||
+      ''
+    ).toLowerCase();
+
+    if (rawPlatform.includes('mac')) return 'macos';
+    if (rawPlatform.includes('win')) return 'windows';
+    if (rawPlatform.includes('linux')) return 'linux';
+    return 'unknown';
+  }
+
+  function isPrimaryModifier(e: KeyboardEvent): boolean {
+    return desktopPlatform === 'macos' ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  }
+
+  function shortcutLabel(key: string): string {
+    return desktopPlatform === 'macos' ? `Cmd+${key}` : `Ctrl+${key}`;
+  }
+
+  function splitShortcutLabel(direction: 'top' | 'bottom' | 'left' | 'right'): string {
+    const arrow = {
+      top: 'Up',
+      bottom: 'Down',
+      left: 'Left',
+      right: 'Right',
+    }[direction];
+
+    return desktopPlatform === 'macos' ? `Cmd+Shift+${arrow}` : `Ctrl+Shift+${arrow}`;
+  }
+
+  function getLocalShellLabel(): string {
+    return desktopPlatform === 'windows' ? 'PowerShell' : 'zsh';
+  }
 
   function measureCharMetrics() {
     const probe = document.createElement('span');
@@ -61,6 +104,7 @@
     remoteOs = $state('');
     remoteShell = $state('');
     cwd = $state('~');
+    cwdFromOsc = $state(false);
     commandRunning = $state(false);
     awaitingInput = $state(false);
 
@@ -88,6 +132,7 @@
 
   let tabs: Tab[] = $state([]);
   let activeTabId = $state('');
+  let homeDir = $state('');
 
   let paneLayout = $state<PaneLayoutType | null>(null);
   let paneInputEls: Record<string, HTMLTextAreaElement> = {};
@@ -154,6 +199,9 @@
           return info.remote_cwd || '/';
         } catch { return '/'; }
       }
+      // Prefer the OSC 7-tracked cwd (always current) over the backend
+      // query which returns stale data on Windows.
+      if (tab.cwdFromOsc) return tab.cwd || null;
       try {
         const cwd: string = await invoke('get_shell_cwd', { sessionId: tab.sessionId });
         return cwd || null;
@@ -166,7 +214,7 @@
     const tab = focusedTab();
     if (!tab || !tab.connected) return;
     try {
-      await invoke('write_to_shell', { sessionId: tab.sessionId, data: `cd '${path}'\n` });
+      await invoke('write_to_shell', { sessionId: tab.sessionId, data: `cd '${path}'\r` });
       setTimeout(() => updateTabState(tab), 500);
     } catch (e) {
       console.error('Failed to cd terminal:', e);
@@ -180,6 +228,29 @@
   let aiExecMode = $state<'auto' | 'manual' | null>(null);
   let aiExecPromptShown = $state(false);
   let currentView = $state<'terminal' | 'settings'>('terminal');
+
+  const ERROR_PATTERNS = [
+    /is not recognized as the name of a cmdlet/i,
+    /is not recognized as an internal or external command/i,
+    /command not found/i,
+    /CommandNotFoundException/,
+    /No such file or directory/i,
+    /Access is denied/i,
+    /PermissionError/i,
+    /permission denied/i,
+    /cannot find the path/i,
+    /The term '.+' is not recognized/i,
+    /: not found$/m,
+    /Unable to execute/i,
+    /failed with exit code/i,
+    /fatal error/i,
+    /^ERROR:/m,
+  ];
+
+  function looksLikeError(output: string): boolean {
+    if (!output.trim()) return false;
+    return ERROR_PATTERNS.some(p => p.test(output));
+  }
 
   const PASSTHROUGH_CMDS = new Set([
     'ls','ll','la','cd','pwd','cat','head','tail','less','more','echo','date','whoami',
@@ -271,7 +342,7 @@
     return themeHighlightPrompt(lineText, getTheme());
   }
 
-  const INTERACTIVE_PROMPT_RE = /(password|passphrase|otp|verification code|auth(?:entication)? code|token|2fa|two-factor|enter .*:|username|login|continue\?|proceed\?|\[y\/n\]|\[y\/N\]|\(y\/n\)|press enter)/i;
+  const INTERACTIVE_PROMPT_RE = /(password|passphrase|otp|verification code|auth(?:entication)? code|token|2fa|two-factor|enter .*:|username|login|do you want to continue|continue\?|proceed\?|yes to all|no to all|default is|selection:|\[y\] yes|\[a\] yes to all|\[n\] no|\[l\] no to all|\[s\] suspend|\[\?\] help|\[y\/n\]|\[y\/N\]|\(y\/n\)|press enter)/i;
 
   function isLikelyInteractivePrompt(lineText: string): boolean {
     const t = lineText.trim();
@@ -296,6 +367,40 @@
     }
 
     return false;
+  }
+
+  function extractInteractivePrompt(output: string): string | null {
+    const lines = output
+      .split('\n')
+      .map(line => line.trimEnd())
+      .filter(line => line.trim().length > 0);
+
+    let matchIndex = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (isLikelyInteractivePrompt(lines[i])) {
+        matchIndex = i;
+        break;
+      }
+    }
+
+    if (matchIndex === -1) return null;
+
+    const start = Math.max(0, matchIndex - 5);
+    return lines.slice(start, matchIndex + 1).join('\n').trim();
+  }
+
+  function buildInteractivePromptResponse(promptText: string): string {
+    const escapedPrompt = promptText.replace(/```/g, '``` ');
+    return [
+      'This command is waiting for input before it can continue.',
+      '',
+      'Respond in the terminal input below to continue, or press `Ctrl+C` to cancel it.',
+      '',
+      'Prompt:',
+      '```text',
+      escapedPrompt,
+      '```',
+    ].join('\n');
   }
 
   let aiAccountId = $state('');
@@ -704,7 +809,7 @@
     if (!tab || !tab.connected) return;
     tab.inputValue = '';
     try {
-      await invoke('write_to_shell', { sessionId: tab.sessionId, data: session.command + '\n' });
+      await invoke('write_to_shell', { sessionId: tab.sessionId, data: session.command + '\r' });
     } catch (e) {
       console.error('Failed to run SSH command:', e);
     }
@@ -1042,13 +1147,13 @@
 
   // AI overlay — multiple blocks per tab (history + active)
   let aiBlockIdCounter = 0;
-  interface AiCmdEntry { text: string; status: 'pending' | 'running' | 'done' | 'error'; output: string }
+  interface AiCmdEntry { text: string; status: 'pending' | 'running' | 'done' | 'error' | 'input'; output: string }
   interface AiToolCallEntry { serverName: string; toolName: string; arguments: string; status: 'pending' | 'running' | 'done' | 'error'; output: string }
   interface AiBlock {
     id: number;
     tabId: string;
     prompt: string;
-    phase: 'choosing' | 'thinking' | 'commands' | 'executing' | 'done' | 'error' | 'answered';
+    phase: 'choosing' | 'thinking' | 'commands' | 'executing' | 'retrying' | 'needs_input' | 'done' | 'error' | 'answered';
     commands: AiCmdEntry[];
     toolCalls: AiToolCallEntry[];
     error: string;
@@ -1061,6 +1166,13 @@
   function getAiBlocks(tabId: string): AiBlock[] {
     return aiBlocks.filter(b => b.tabId === tabId);
   }
+
+  function getVisibleAiBlocks(tabId: string): AiBlock[] {
+    const blocks = getAiBlocks(tabId);
+    if (agenticMode) return blocks;
+    return blocks.filter(b => b.phase !== 'done' && b.phase !== 'error' && b.phase !== 'answered');
+  }
+
   function getActiveAiBlock(tabId: string): AiBlock | null {
     return aiBlocks.findLast(b => b.tabId === tabId && b.phase !== 'done' && b.phase !== 'error' && b.phase !== 'answered') ?? null;
   }
@@ -1079,6 +1191,14 @@
   function removeAiBlock(blockId: number) {
     aiBlocks = aiBlocks.filter(b => b.id !== blockId);
     aiExecDropdownOpen = false;
+  }
+
+  function renderAiAnswer(response: string): string {
+    return renderMarkdown(response.trim());
+  }
+
+  function getAiExecutedCount(block: AiBlock): number {
+    return block.commands.length + block.toolCalls.length;
   }
 
   let activeBlockId = $state(0);
@@ -1108,7 +1228,7 @@
       tab.inputValue = '';
       resetInputHeight(tab.id);
       try {
-        await invoke('write_to_shell', { sessionId: tab.sessionId, data: input + '\n' });
+        await invoke('write_to_shell', { sessionId: tab.sessionId, data: input + '\r' });
       } catch (e) {
         console.error('Failed to execute passthrough command:', e);
       }
@@ -1143,7 +1263,7 @@
       prompt: input,
       cwd: tab.cwd || null,
       osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
-      shell: tab.sshTarget ? (tab.remoteShell || 'bash') : 'zsh',
+      shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
       sshTarget: tab.sshTarget || null,
     };
     let response: string;
@@ -1237,27 +1357,108 @@
         scrollToBottom();
       }
 
-      // Execute shell commands
-      for (let i = 0; i < commands.length; i++) {
-        commands[i].status = 'running';
-        updateAiBlock(block.id, { commands: [...commands] });
-        scrollToBottom();
+      // Execute shell commands with retry loop
+      const MAX_RETRIES = 3;
+      const failedAttempts: { command: string; error: string }[] = [];
+      let inputPrompt: string | null = null;
+      // allCommands tracks every command shown to the user (including retries)
+      let allCommands: AiCmdEntry[] = [...commands];
+      // pendingCmds are the ones to execute in this iteration
+      let pendingCmds = commands;
 
-        const linesBefore = getPlainLines(tab).length;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const errorCmds: { command: string; error: string }[] = [];
+
+        for (let i = 0; i < pendingCmds.length; i++) {
+          pendingCmds[i].status = 'running';
+          updateAiBlock(block.id, { commands: [...allCommands] });
+          scrollToBottom();
+
+          const linesBefore = getPlainLines(tab).length;
+          try {
+            await invoke('write_to_shell', { sessionId: tab.sessionId, data: pendingCmds[i].text + '\r' });
+            const timeout = tab.sshTarget ? 5000 : 2000;
+            const output = await waitForOutput(tab, linesBefore, timeout);
+            pendingCmds[i].output = output;
+
+            const interactivePrompt = extractInteractivePrompt(output);
+            if (tab.awaitingInput || interactivePrompt) {
+              pendingCmds[i].status = 'input';
+              inputPrompt = interactivePrompt || output.trim() || 'Command is waiting for input.';
+              break;
+            }
+
+            if (looksLikeError(output)) {
+              pendingCmds[i].status = 'error';
+              errorCmds.push({ command: pendingCmds[i].text, error: output });
+            } else {
+              pendingCmds[i].status = 'done';
+            }
+          } catch (e) {
+            pendingCmds[i].status = 'error';
+            pendingCmds[i].output = String(e);
+            errorCmds.push({ command: pendingCmds[i].text, error: String(e) });
+          }
+          updateAiBlock(block.id, { commands: [...allCommands] });
+          scrollToBottom();
+        }
+
+        if (inputPrompt) break;
+
+        // If no errors or exhausted retries, stop
+        if (errorCmds.length === 0 || attempt === MAX_RETRIES) break;
+
+        // Ask AI for alternative commands
+        failedAttempts.push(...errorCmds);
+        updateAiBlock(block.id, { phase: 'retrying' });
+        scrollToBottom();
         try {
-          await invoke('write_to_shell', { sessionId: tab.sessionId, data: commands[i].text + '\n' });
-          const timeout = tab.sshTarget ? 5000 : 2000;
-          const output = await waitForOutput(tab, linesBefore, timeout);
-          commands[i].status = 'done';
-          commands[i].output = output;
-        } catch (e) {
-          commands[i].status = 'error';
-          commands[i].output = String(e);
-          updateAiBlock(block.id, { commands: [...commands] });
+          const retryResponse: string = await invoke('ai_retry', {
+            accountId: aiAccountId,
+            apiToken: aiApiToken,
+            originalPrompt: input,
+            failedAttempts,
+            cwd: tab.cwd || null,
+            osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
+            shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
+            sshTarget: tab.sshTarget || null,
+          });
+
+          const retryText = retryResponse.trim();
+
+          // If AI says it can't be done or answers directly, stop retrying
+          if (retryText.startsWith('ERROR:') || retryText.startsWith('ANSWER:')) {
+            const label = retryText.startsWith('ANSWER:') ? retryText.substring(7).trim() : retryText;
+            allCommands.push({ text: '[AI] ' + label, status: 'done' as const, output: '' });
+            updateAiBlock(block.id, { commands: [...allCommands] });
+            break;
+          }
+
+          const retryLines = retryText.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#') && !l.startsWith('ERROR:'));
+          if (retryLines.length === 0) break;
+
+          // Create new command entries and queue them for the next iteration
+          pendingCmds = retryLines.map(c => ({ text: c, status: 'pending' as const, output: '' }));
+          allCommands = [...allCommands, ...pendingCmds];
+          updateAiBlock(block.id, { commands: [...allCommands], phase: 'executing' });
+        } catch {
+          // Retry request failed - stop
           break;
         }
-        updateAiBlock(block.id, { commands: [...commands] });
+      }
+
+      if (inputPrompt) {
+        updateAiBlock(block.id, {
+          phase: 'needs_input',
+          commands: [...allCommands],
+          response: buildInteractivePromptResponse(inputPrompt),
+          raw: rawText,
+        });
+        aiLoading = false;
+        pendingCommand = '';
         scrollToBottom();
+        setTimeout(() => updateTabState(tab), 500);
+        return;
       }
 
       // Step 4: Summarize results
@@ -1271,7 +1472,8 @@
           output: t.output,
           is_error: t.status === 'error',
         }));
-        const commandResults = commands.map(c => ({ command: c.text, output: c.output }));
+        const realCommands = allCommands.filter(c => !c.text.startsWith('[AI]'));
+        const commandResults = realCommands.map(c => ({ command: c.text, output: c.output }));
 
         let summary: string;
         if (hasToolCalls) {
@@ -1290,7 +1492,12 @@
             commandResults,
           });
         }
-        updateAiBlock(block.id, { phase: 'answered', response: summary.trim(), raw: rawText });
+        // Include any ANSWER/ERROR messages from retries
+        const aiMessages = allCommands.filter(c => c.text.startsWith('[AI]')).map(c => c.text.substring(5));
+        const fullSummary = aiMessages.length > 0
+          ? aiMessages.join('\n') + '\n\n' + summary.trim()
+          : summary.trim();
+        updateAiBlock(block.id, { phase: 'answered', response: fullSummary, raw: rawText });
       } catch {
         updateAiBlock(block.id, { phase: 'done' });
       }
@@ -1319,6 +1526,7 @@
     let stableTime = 0;
     while (Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 150));
+      if (tab.awaitingInput) break;
       const lines = getPlainLines(tab);
       if (lines.length !== lastCount) {
         lastCount = lines.length;
@@ -1334,7 +1542,7 @@
     while (newLines.length > 0 && newLines[newLines.length - 1].trim() === '') newLines.pop();
     if (newLines.length > 0) {
       const last = newLines[newLines.length - 1];
-      if (last.includes('$') || last.includes('%') || last.includes('#')) newLines.pop();
+      if (last.includes('$') || last.includes('%') || last.includes('#') || /^PS .+>/.test(last.trim())) newLines.pop();
     }
     return newLines.join('\n');
   }
@@ -1351,10 +1559,26 @@
       const linesBefore = getPlainLines(tab).length;
 
       try {
-        await invoke('write_to_shell', { sessionId: tab.sessionId, data: block.commands[i].text + '\n' });
+        await invoke('write_to_shell', { sessionId: tab.sessionId, data: block.commands[i].text + '\r' });
         const output = await waitForOutput(tab, linesBefore);
-        block.commands[i].status = 'done';
         block.commands[i].output = output;
+
+        const interactivePrompt = extractInteractivePrompt(output);
+        if (tab.awaitingInput || interactivePrompt) {
+          block.commands[i].status = 'input';
+          updateAiBlock(blockId, {
+            commands: [...block.commands],
+            phase: 'needs_input',
+            response: buildInteractivePromptResponse(interactivePrompt || output.trim() || 'Command is waiting for input.'),
+          });
+          pendingCommand = '';
+          await tick();
+          scrollToBottom();
+          setTimeout(() => updateTabState(tab), 500);
+          return;
+        }
+
+        block.commands[i].status = 'done';
       } catch (e) {
         block.commands[i].status = 'error';
         block.commands[i].output = String(e);
@@ -1579,6 +1803,22 @@
         tab.title = title === '~' ? '~' : parts.length <= 3 ? title : '…/' + parts.slice(-3).join('/');
       }
     };
+    tab.emulator.onCwdChange = (cwdPath: string) => {
+      // Normalize: replace home prefix with ~, use forward slashes
+      const home = homeDir;
+      let cwd = cwdPath.replace(/\\/g, '/').replace(/\/$/, '');
+      if (home) {
+        const h = home.replace(/\\/g, '/').replace(/\/$/, '');
+        if (cwd === h) cwd = '~';
+        else if (cwd.startsWith(h + '/')) cwd = '~' + cwd.substring(h.length);
+      }
+      tab.cwd = cwd;
+      tab.cwdFromOsc = true;
+      if (!tab.customTitle) {
+        const parts = cwd.replace(/^(~\/|\/)+/, '').split('/').filter(Boolean);
+        tab.title = cwd === '~' ? '~' : parts.length <= 3 ? cwd : '…/' + parts.slice(-3).join('/');
+      }
+    };
   }
 
   async function createTab(): Promise<void> {
@@ -1620,6 +1860,9 @@
 
   async function updateTabCwd(tab: Tab) {
     if (!tab.connected) return;
+    // If cwd is already tracked via OSC 7 (shell prompt), skip the backend
+    // query which can return stale data on Windows.
+    if (tab.cwdFromOsc) return;
     try {
       const cwd: string = await invoke('get_shell_cwd', { sessionId: tab.sessionId });
       if (cwd) {
@@ -1693,7 +1936,7 @@
         const wasConnected = tab.connected;
         tab.connected = false;
         if (wasConnected) {
-          invoke('write_to_shell', { sessionId: tab.sessionId, data: 'exit\n' }).catch(() => {});
+          invoke('write_to_shell', { sessionId: tab.sessionId, data: 'exit\r' }).catch(() => {});
         }
       }
       tabs = tabs.filter(t => t.id !== tabId);
@@ -1937,7 +2180,7 @@
     tab.connected = false;
 
     if (wasConnected) {
-      invoke('write_to_shell', { sessionId: tab.sessionId, data: 'exit\n' }).catch(() => {});
+      invoke('write_to_shell', { sessionId: tab.sessionId, data: 'exit\r' }).catch(() => {});
     }
     // Dispose canvas instance if present
     if (tuiCanvases[tabId]) {
@@ -2020,7 +2263,7 @@
     tab.commandRunning = true;
 
     try {
-      await invoke('write_to_shell', { sessionId: tab.sessionId, data: cmd + '\n' });
+      await invoke('write_to_shell', { sessionId: tab.sessionId, data: cmd + '\r' });
     } catch (e) {
       console.error('Failed to write to shell:', e);
     }
@@ -2070,8 +2313,8 @@
     // When a command is running, forward keystrokes directly to PTY
     // so interactive prompts (arrow-key menus, yes/no, etc.) work
     if (tab.commandRunning && tab.connected) {
-      // Keep meta shortcuts working
-      if (e.metaKey) {
+      // Keep app shortcuts working while the PTY owns the input stream.
+      if (isPrimaryModifier(e)) {
         if (e.key === 't') { e.preventDefault(); createTab(); return; }
         if (e.key === 'w') { e.preventDefault(); closeTab(tab.id); return; }
         if (e.key === 'k' || e.key === 'l') { e.preventDefault(); tab.emulator.reset(); tab.renderVersion++; return; }
@@ -2133,6 +2376,10 @@
       e.preventDefault();
       if (agenticMode) {
         handleAgenticSubmit();
+      } else if (!tab.inputValue.trim() && tab.connected) {
+        // Empty input: forward Enter directly to PTY so interactive programs
+        // (e.g. claude, codex trust dialogs) receive it
+        invoke('write_to_shell', { sessionId: tab.sessionId, data: '\r' });
       } else {
         sendCommand();
       }
@@ -2164,8 +2411,8 @@
       if (tab.connected) {
         invoke('write_to_shell', { sessionId: tab.sessionId, data: '\x03' });
       }
-    } else if (e.key === 'c' && e.metaKey && !e.ctrlKey) {
-      // Cmd+C: copy selected text (let browser handle)
+    } else if (e.key === 'c' && isPrimaryModifier(e)) {
+      // Let the browser handle primary-modifier copy for selected text.
       return;
     } else if (e.key === 'd' && e.ctrlKey && !e.metaKey) {
       // Ctrl+D: send EOF
@@ -2173,20 +2420,20 @@
       if (tab.connected) {
         invoke('write_to_shell', { sessionId: tab.sessionId, data: '\x04' });
       }
-    } else if (e.key === 'k' && e.metaKey) {
-      // Cmd+K: clear terminal
+    } else if (e.key === 'k' && isPrimaryModifier(e)) {
+      // Primary+K: clear terminal
       e.preventDefault();
       tab.emulator.reset();
       tab.renderVersion++;
       scrollToBottom();
-    } else if (e.key === 'l' && e.metaKey) {
+    } else if (e.key === 'l' && isPrimaryModifier(e)) {
       e.preventDefault();
       tab.emulator.reset();
       tab.renderVersion++;
-    } else if (e.key === 't' && e.metaKey) {
+    } else if (e.key === 't' && isPrimaryModifier(e)) {
       e.preventDefault();
       createTab();
-    } else if (e.key === 'w' && e.metaKey) {
+    } else if (e.key === 'w' && isPrimaryModifier(e)) {
       e.preventDefault();
       if (paneLayout && getAllLeaves(paneLayout.root).length > 1) {
         // Close current pane if multiple panes exist
@@ -2195,20 +2442,20 @@
         // Close tab if only one pane
         closeTab(activeTabId);
       }
-    } else if (e.key === 'ArrowUp' && e.metaKey && e.shiftKey) {
+    } else if (e.key === 'ArrowUp' && isPrimaryModifier(e) && e.shiftKey) {
       e.preventDefault();
       if (paneLayout) handleSplitPane(paneLayout.focusedPaneId, 'top');
-    } else if (e.key === 'ArrowDown' && e.metaKey && e.shiftKey) {
+    } else if (e.key === 'ArrowDown' && isPrimaryModifier(e) && e.shiftKey) {
       e.preventDefault();
       if (paneLayout) handleSplitPane(paneLayout.focusedPaneId, 'bottom');
-    } else if (e.key === 'ArrowLeft' && e.metaKey && e.shiftKey) {
+    } else if (e.key === 'ArrowLeft' && isPrimaryModifier(e) && e.shiftKey) {
       e.preventDefault();
       if (paneLayout) handleSplitPane(paneLayout.focusedPaneId, 'left');
-    } else if (e.key === 'ArrowRight' && e.metaKey && e.shiftKey) {
+    } else if (e.key === 'ArrowRight' && isPrimaryModifier(e) && e.shiftKey) {
       e.preventDefault();
       if (paneLayout) handleSplitPane(paneLayout.focusedPaneId, 'right');
-    } else if (e.metaKey && e.key >= '1' && e.key <= '9') {
-      // Cmd+1..9: switch to tab by index
+    } else if (isPrimaryModifier(e) && e.key >= '1' && e.key <= '9') {
+      // Primary+1..9: switch to tab by index
       e.preventDefault();
       const idx = parseInt(e.key) - 1;
       if (idx < tabs.length) {
@@ -2267,26 +2514,26 @@
 
   function handleTuiKeydown(e: KeyboardEvent, tab: Tab) {
     if (!tab.connected) return;
-    // Meta shortcuts still work in TUI mode
-    if (e.key === 't' && e.metaKey) {
+    // App shortcuts still work in TUI mode.
+    if (e.key === 't' && isPrimaryModifier(e)) {
       e.preventDefault();
       createTab();
       return;
     }
-    if (e.key === 'w' && e.metaKey) {
+    if (e.key === 'w' && isPrimaryModifier(e)) {
       e.preventDefault();
       closeTab(tab.id);
       return;
     }
-    if (e.key === 'c' && e.metaKey) {
-      // Cmd+C: copy selected text from canvas
+    if (e.key === 'c' && isPrimaryModifier(e)) {
+      // Primary+C copies selected text from the canvas if present.
       const tc = tuiCanvases[tab.id];
       if (!tc || !tc.hasSelection()) return;
       e.preventDefault();
       document.execCommand('copy');
       return;
     }
-    if (e.key === 'v' && e.metaKey) {
+    if (e.key === 'v' && isPrimaryModifier(e)) {
       e.preventDefault();
       navigator.clipboard.readText().then(text => {
         if (text && tab.connected) {
@@ -2295,7 +2542,7 @@
       }).catch(() => {});
       return;
     }
-    if (e.metaKey && e.key >= '1' && e.key <= '9') {
+    if (isPrimaryModifier(e) && e.key >= '1' && e.key <= '9') {
       e.preventDefault();
       const idx = parseInt(e.key) - 1;
       if (idx < tabs.length) switchTab(tabs[idx].id);
@@ -2366,6 +2613,10 @@
   onMount(() => {
     let resizeObserver: ResizeObserver;
 
+    desktopPlatform = detectDesktopPlatform();
+    document.documentElement.dataset.platform = desktopPlatform;
+    getHomeDir().then(h => { homeDir = h; }).catch(() => {});
+
     async function init() {
       measureCharMetrics();
 
@@ -2380,7 +2631,9 @@
           const curRow = tab.emulator.cursorRow;
           if (curRow >= 0 && curRow < lines.length) {
             const lineText = lines[curRow].map((r: { text: string }) => r.text).join('').trimEnd();
-            if (lineText && highlightPrompt(lineText)) {
+            // Only clear commandRunning when we see a bare prompt (no command text after symbol)
+            // This avoids false positives from echoed command lines like "PS C:\path> claude"
+            if (lineText && isBarePrompt(lineText)) {
               tab.commandRunning = false;
               tab.awaitingInput = false;
             } else {
@@ -2462,10 +2715,15 @@
   <div class="main-area">
     <!-- Titlebar -->
     <header class="titlebar" data-tauri-drag-region>
+      <div class="titlebar-brand" data-tauri-drag-region>
+        <div class="titlebar-brand-mark" aria-hidden="true"></div>
+        <span class="titlebar-brand-text" data-tauri-drag-region>Drover</span>
+      </div>
       {#if currentView === 'settings'}
-        <button class="titlebar-back" onclick={closeSettings}>← Terminal</button>
-        <span class="titlebar-title" data-tauri-drag-region>Settings</span>
-        <div class="titlebar-spacer" data-tauri-drag-region></div>
+        <div class="titlebar-settings-nav">
+          <button class="titlebar-back" onclick={closeSettings}>Back to Terminal</button>
+          <span class="titlebar-title" data-tauri-drag-region>Settings</span>
+        </div>
       {:else}
         <div class="tab-bar">
           {#each tabs as tab}
@@ -2510,9 +2768,8 @@
           <button class="tab-add" onclick={() => createTab()} aria-label="New tab">+</button>
         </div>
       {/if}
-      {#if currentView === 'terminal'}
-        <div class="titlebar-spacer" data-tauri-drag-region></div>
-      {/if}
+      <div class="titlebar-spacer" data-tauri-drag-region></div>
+      <div class="titlebar-caption-space" data-tauri-drag-region aria-hidden="true"></div>
     </header>
 
     {#if currentView === 'settings'}
@@ -2637,14 +2894,16 @@
                     {/each}
 
                     <!-- AI blocks (history + active) -->
-                    {#each getAiBlocks(paneLeaf.tabId) as block (block.id)}
-                      <div class="ai-block" class:ai-block-done={block.phase === 'done' || block.phase === 'answered'} class:ai-block-error={block.phase === 'error'} use:scrollIntoAiBlock={block.phase !== 'done' && block.phase !== 'error' && block.phase !== 'answered'}>
-                        <div class="ai-block-header">
-                          <span class="ai-block-icon">
-                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path></svg>
-                          </span>
-                          <span class="ai-block-prompt">{block.prompt}</span>
-                          {#if block.phase === 'done' || block.phase === 'error' || block.phase === 'answered'}
+                    {#each getVisibleAiBlocks(paneLeaf.tabId) as block (block.id)}
+                      <div class="ai-thread" use:scrollIntoAiBlock={block.phase !== 'done' && block.phase !== 'error' && block.phase !== 'answered'}>
+                        <!-- User question -->
+                        <div class="ai-thread-question">
+                          <div class="ai-thread-label">
+                            <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                            You
+                          </div>
+                          <div class="ai-thread-question-text">{block.prompt}</div>
+                          {#if block.phase === 'done' || block.phase === 'error' || block.phase === 'answered' || block.phase === 'needs_input'}
                             <button class="ai-block-dismiss" onclick={() => removeAiBlock(block.id)} title="Remove">
                               <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                             </button>
@@ -2656,8 +2915,13 @@
                         </div>
 
                         {#if block.phase === 'choosing'}
-                          <div class="ai-block-body">
-                            <div class="ai-block-question">How should AI commands be executed?</div>
+                          <!-- Execution mode chooser -->
+                          <div class="ai-thread-answer">
+                            <div class="ai-thread-label ai-thread-label-ai">
+                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path></svg>
+                              Drover
+                            </div>
+                            <div class="ai-block-question">How should I execute commands?</div>
                             <div class="ai-block-actions ai-block-actions-end">
                               <div class="ai-exec-dropdown-wrap">
                                 <button class="ai-action-btn ai-action-btn-primary" onclick={() => chooseAiExecMode('auto')}>
@@ -2680,96 +2944,165 @@
                           </div>
 
                         {:else if block.phase === 'thinking'}
-                          <div class="ai-block-body">
-                            <div class="ai-block-status">
-                              <span class="ai-spinner"></span> Thinking...
-                            </div>
+                          <div class="ai-thread-status">
+                            <span class="ai-spinner"></span> Thinking...
                           </div>
 
                         {:else if block.phase === 'error'}
-                          <div class="ai-block-body">
-                            <div class="ai-block-error">{block.error}</div>
-                          </div>
-
-                        {:else if block.phase === 'answered'}
-                          <div class="ai-block-body">
-                            <div class="ai-block-response">{block.response}</div>
-                          </div>
-
-                        {:else if block.phase === 'commands' || block.phase === 'executing' || block.phase === 'done'}
-                          <div class="ai-block-body">
-                            {#if block.toolCalls.length > 0}
-                              <div class="ai-block-cmds">
-                                {#each block.toolCalls as tc, ti}
-                                  <div class="ai-cmd-entry">
-                                    <div class="ai-cmd-row" class:ai-cmd-running={tc.status === 'running'} class:ai-cmd-done={tc.status === 'done'} class:ai-cmd-error={tc.status === 'error'}>
-                                      <span class="ai-cmd-indicator">
-                                        {#if tc.status === 'running'}
-                                          <span class="ai-spinner-sm"></span>
-                                        {:else if tc.status === 'done'}
-                                          <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-green)" stroke-width="2.5" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                        {:else if tc.status === 'error'}
-                                          <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-red)" stroke-width="2.5" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                                        {:else}
-                                          <span class="ai-cmd-num">{ti + 1}</span>
-                                        {/if}
-                                      </span>
-                                      <code class="ai-cmd-text"><span style="color: var(--accent-primary); opacity: 0.6;">MCP</span> {tc.serverName} → {tc.toolName}</code>
-                                    </div>
-                                    {#if tc.output}
-                                      <pre class="ai-cmd-output">{tc.output.length > 500 ? tc.output.substring(0, 500) + '...' : tc.output}</pre>
-                                    {/if}
-                                  </div>
-                                {/each}
-                              </div>
-                            {/if}
-                            <div class="ai-block-cmds">
-                              {#each block.commands as cmd, ci}
-                                <div class="ai-cmd-entry">
-                                  <div class="ai-cmd-row" class:ai-cmd-running={cmd.status === 'running'} class:ai-cmd-done={cmd.status === 'done'} class:ai-cmd-error={cmd.status === 'error'}>
-                                    <span class="ai-cmd-indicator">
-                                      {#if cmd.status === 'running'}
-                                        <span class="ai-spinner-sm"></span>
-                                      {:else if cmd.status === 'done'}
-                                        <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-green)" stroke-width="2.5" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                      {:else if cmd.status === 'error'}
-                                        <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-red)" stroke-width="2.5" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                                      {:else}
-                                        <span class="ai-cmd-num">{ci + 1}</span>
-                                      {/if}
-                                    </span>
-                                    <code class="ai-cmd-text">{cmd.text}</code>
-                                  </div>
-                                  {#if cmd.output}
-                                    <pre class="ai-cmd-output">{cmd.output}</pre>
-                                  {/if}
-                                </div>
-                              {/each}
+                          <div class="ai-thread-answer ai-thread-answer-error">
+                            <div class="ai-thread-label ai-thread-label-ai">
+                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path></svg>
+                              Drover
                             </div>
-
-                            {#if block.phase === 'commands'}
-                              <div class="ai-block-actions ai-block-actions-end">
-                                <button class="ai-action-btn ai-action-btn-muted" onclick={cancelPendingCommand}>Dismiss</button>
-                                <button class="ai-action-btn" onclick={copyPendingToTerminal}>
-                                  <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
-                                  Edit
-                                </button>
-                                <button class="ai-action-btn ai-action-btn-primary" onclick={executePendingCommand}>
-                                  <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-                                  Run
-                                </button>
-                              </div>
-                            {:else if block.phase === 'executing'}
-                              <div class="ai-block-status ai-block-status-exec">
-                                <span class="ai-spinner"></span> Executing...
-                              </div>
-                            {:else if block.phase === 'done'}
-                              <div class="ai-block-status ai-block-status-done">
-                                <svg viewBox="0 0 24 24" width="14" height="14" stroke="var(--term-green)" stroke-width="2" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                Done
-                              </div>
-                            {/if}
+                            <div class="ai-thread-error-text">{block.error}</div>
                           </div>
+
+                        {:else}
+                          <!-- Commands section (shown during executing/retrying/commands/done/answered) -->
+                          {#if block.commands.length > 0 || block.toolCalls.length > 0}
+                            <div class="ai-thread-commands" class:ai-thread-commands-collapsed={block.phase === 'answered'}>
+                              <button class="ai-thread-commands-header" onclick={(e) => { const el = (e.currentTarget as HTMLElement).parentElement; el?.classList.toggle('ai-thread-commands-collapsed'); }}>
+                                <svg class="ai-thread-commands-chevron" viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                                <span class="ai-thread-commands-label">
+                                  {#if block.phase === 'executing' || block.phase === 'retrying'}
+                                    <span class="ai-spinner-sm"></span>
+                                  {:else}
+                                    <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+                                  {/if}
+                                  {#if block.phase === 'retrying'}
+                                    Retrying with alternative...
+                                  {:else if block.phase === 'executing'}
+                                    Running {getAiExecutedCount(block)} step{getAiExecutedCount(block) > 1 ? 's' : ''}...
+                                  {:else if block.phase === 'needs_input'}
+                                    Waiting for input
+                                  {:else}
+                                    {getAiExecutedCount(block)} step{getAiExecutedCount(block) > 1 ? 's' : ''} executed
+                                  {/if}
+                                </span>
+                              </button>
+                              <div class="ai-thread-commands-body">
+                                {#if block.toolCalls.length > 0}
+                                  <div class="ai-thread-section-heading">MCP tool calls</div>
+                                  <div class="ai-block-cmds">
+                                    {#each block.toolCalls as tc, ti}
+                                      <div class="ai-cmd-entry">
+                                        <div class="ai-cmd-row" class:ai-cmd-running={tc.status === 'running'} class:ai-cmd-done={tc.status === 'done'} class:ai-cmd-error={tc.status === 'error'}>
+                                          <span class="ai-cmd-indicator">
+                                            {#if tc.status === 'running'}
+                                              <span class="ai-spinner-sm"></span>
+                                            {:else if tc.status === 'done'}
+                                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-green)" stroke-width="2.5" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                            {:else if tc.status === 'error'}
+                                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-red)" stroke-width="2.5" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                                            {:else}
+                                              <span class="ai-cmd-num">{ti + 1}</span>
+                                            {/if}
+                                          </span>
+                                          <code class="ai-cmd-text"><span class="ai-cmd-kind ai-cmd-kind-tool">Tool</span>{tc.serverName} -> {tc.toolName}</code>
+                                        </div>
+                                        {#if tc.output}
+                                          <pre class="ai-cmd-output">{tc.output.length > 500 ? tc.output.substring(0, 500) + '...' : tc.output}</pre>
+                                        {/if}
+                                      </div>
+                                    {/each}
+                                  </div>
+                                {/if}
+                                {#if block.commands.length > 0}
+                                  <div class="ai-thread-section-heading">Shell commands</div>
+                                  <div class="ai-block-cmds">
+                                    {#each block.commands as cmd, ci}
+                                      <div class="ai-cmd-entry">
+                                        <div class="ai-cmd-row" class:ai-cmd-running={cmd.status === 'running'} class:ai-cmd-done={cmd.status === 'done'} class:ai-cmd-error={cmd.status === 'error'} class:ai-cmd-input={cmd.status === 'input'}>
+                                          <span class="ai-cmd-indicator">
+                                            {#if cmd.status === 'running'}
+                                              <span class="ai-spinner-sm"></span>
+                                            {:else if cmd.status === 'done'}
+                                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-green)" stroke-width="2.5" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                            {:else if cmd.status === 'error'}
+                                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-red)" stroke-width="2.5" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                                            {:else if cmd.status === 'input'}
+                                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="var(--term-yellow)" stroke-width="2.5" fill="none"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5"></path><circle cx="12" cy="16.5" r="0.8" fill="var(--term-yellow)" stroke="none"></circle></svg>
+                                            {:else}
+                                              <span class="ai-cmd-num">{ci + 1}</span>
+                                            {/if}
+                                          </span>
+                                          <code class="ai-cmd-text">
+                                            {#if cmd.text.startsWith('[AI] ')}
+                                              <span class="ai-cmd-kind ai-cmd-kind-note">Note</span>{cmd.text.substring(5)}
+                                            {:else}
+                                              <span class="ai-cmd-kind ai-cmd-kind-shell">Shell</span>{cmd.text}
+                                            {/if}
+                                          </code>
+                                        </div>
+                                        {#if cmd.output}
+                                          <pre class="ai-cmd-output">{cmd.output}</pre>
+                                        {/if}
+                                      </div>
+                                    {/each}
+                                  </div>
+                                {/if}
+                              </div>
+
+                              {#if block.phase === 'commands'}
+                                <div class="ai-block-actions ai-block-actions-end" style="padding: 8px 12px;">
+                                  <button class="ai-action-btn ai-action-btn-muted" onclick={cancelPendingCommand}>Dismiss</button>
+                                  <button class="ai-action-btn" onclick={copyPendingToTerminal}>
+                                    <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+                                    Edit
+                                  </button>
+                                  <button class="ai-action-btn ai-action-btn-primary" onclick={executePendingCommand}>
+                                    <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                                    Run
+                                  </button>
+                                </div>
+                              {/if}
+                            </div>
+                          {/if}
+
+                          <!-- Answer section -->
+                          {#if block.phase === 'needs_input'}
+                            <div class="ai-thread-answer ai-thread-answer-input">
+                              <div class="ai-thread-label ai-thread-label-ai">
+                                <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path></svg>
+                                Drover
+                              </div>
+                              <div class="ai-thread-answer-head">
+                                <div class="ai-thread-answer-title">Input required</div>
+                                <div class="ai-thread-answer-meta">Shell waiting</div>
+                              </div>
+                              <div class="ai-thread-answer-text markdown-body">{@html renderAiAnswer(block.response)}</div>
+                            </div>
+                          {:else if block.phase === 'answered'}
+                            <div class="ai-thread-answer">
+                              <div class="ai-thread-label ai-thread-label-ai">
+                                <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path></svg>
+                                Drover
+                              </div>
+                              <div class="ai-thread-answer-head">
+                                <div class="ai-thread-answer-title">Answer</div>
+                                {#if getAiExecutedCount(block) > 0}
+                                  <div class="ai-thread-answer-meta">{getAiExecutedCount(block)} step{getAiExecutedCount(block) > 1 ? 's' : ''}</div>
+                                {/if}
+                              </div>
+                              <div class="ai-thread-answer-text markdown-body">{@html renderAiAnswer(block.response)}</div>
+                            </div>
+                          {:else if block.phase === 'executing' || block.phase === 'retrying'}
+                            <!-- handled by status above or commands section -->
+                          {:else if block.phase === 'done'}
+                            <div class="ai-thread-answer ai-thread-answer-done">
+                              <div class="ai-thread-label ai-thread-label-ai">
+                                <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path></svg>
+                                Drover
+                              </div>
+                              <div class="ai-thread-answer-head">
+                                <div class="ai-thread-answer-title">Execution complete</div>
+                                {#if getAiExecutedCount(block) > 0}
+                                  <div class="ai-thread-answer-meta">{getAiExecutedCount(block)} step{getAiExecutedCount(block) > 1 ? 's' : ''}</div>
+                                {/if}
+                              </div>
+                              <div class="ai-thread-answer-text ai-thread-answer-text-muted">Commands executed successfully.</div>
+                            </div>
+                          {/if}
                         {/if}
                       </div>
                     {/each}
@@ -2998,7 +3331,7 @@
                 {:else if editorSaveStatus === 'error'}
                   <span class="right-pane-badge right-pane-badge-error">Failed</span>
                 {/if}
-                <button class="right-pane-btn" onclick={() => editorViewRef?.saveFile()} title="Save (⌘S)" aria-label="Save" disabled={!editorDirty}>
+                <button class="right-pane-btn" onclick={() => editorViewRef?.saveFile()} title={`Save (${shortcutLabel('S')})`} aria-label="Save" disabled={!editorDirty}>
                   <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
                 </button>
                 {#if isMarkdownFile(editorFileName)}
@@ -3095,24 +3428,29 @@
         <button class="pane-context-item" onclick={() => contextSplit('right')} role="menuitem">
           <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="8" y1="1" x2="8" y2="15"/></svg>
           Split Right
+            <span class="pane-context-shortcut">{splitShortcutLabel('right')}</span>
         </button>
         <button class="pane-context-item" onclick={() => contextSplit('bottom')} role="menuitem">
           <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="1" y1="8" x2="15" y2="8"/></svg>
           Split Down
+            <span class="pane-context-shortcut">{splitShortcutLabel('bottom')}</span>
         </button>
         <button class="pane-context-item" onclick={() => contextSplit('left')} role="menuitem">
           <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="8" y1="1" x2="8" y2="15"/></svg>
           Split Left
+            <span class="pane-context-shortcut">{splitShortcutLabel('left')}</span>
         </button>
         <button class="pane-context-item" onclick={() => contextSplit('top')} role="menuitem">
           <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="14" height="14" rx="2"/><line x1="1" y1="8" x2="15" y2="8"/></svg>
           Split Up
+            <span class="pane-context-shortcut">{splitShortcutLabel('top')}</span>
         </button>
         {#if paneLayout && getAllLeaves(paneLayout.root).length > 1}
           <div class="pane-context-separator"></div>
           <button class="pane-context-item danger" onclick={contextClose} role="menuitem">
             <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/></svg>
             Close Pane
+            <span class="pane-context-shortcut">{shortcutLabel('W')}</span>
           </button>
         {/if}
       </div>
@@ -3128,7 +3466,7 @@
         <span>{rightPane === 'editor' ? 'Editor' : rightPane === 'preview' ? 'Preview' : rightPane === 'markdown' ? 'Markdown Preview' : agenticMode ? 'AI Mode' : 'Terminal'}</span>
       </div>
       <div class="status-item">
-        <span>{rightPane === 'editor' ? editorLang : 'zsh'}</span>
+        <span>{rightPane === 'editor' ? editorLang : getLocalShellLabel()}</span>
       </div>
       <div class="status-spacer"></div>
       <div class="status-item">
@@ -3137,3 +3475,4 @@
     </footer>
   </div>
 </div>
+

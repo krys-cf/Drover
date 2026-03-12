@@ -26,12 +26,24 @@ pub struct DirEntry {
     pub path: String,
 }
 
+/// Normalize a path to use forward slashes (for consistent frontend handling on all platforms)
+fn normalize_separators(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 fn expand_home(path: &str) -> String {
     if path.starts_with('~') {
         if let Some(home) = dirs::home_dir() {
-            return path.replacen('~', &home.to_string_lossy().as_ref(), 1);
+            let expanded = path.replacen('~', &home.to_string_lossy().as_ref(), 1);
+            // On Windows, the frontend uses forward slashes but the OS needs native separators
+            return expanded.replace('/', std::path::MAIN_SEPARATOR_STR);
         }
     }
+    #[cfg(windows)]
+    {
+        return path.replace('/', "\\");
+    }
+    #[allow(unreachable_code)]
     path.to_string()
 }
 
@@ -42,10 +54,10 @@ fn replace_home_prefix(path: &str) -> String {
             return "~".to_string();
         }
         if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
-            return format!("~{rest}");
+            return normalize_separators(&format!("~{rest}"));
         }
     }
-    path.to_string()
+    normalize_separators(path)
 }
 
 #[tauri::command]

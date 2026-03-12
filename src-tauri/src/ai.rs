@@ -159,16 +159,18 @@ pub async fn ai_summarize(
         results_block.push_str(&format!("$ {}\n{}\n\n", cr.command, cr.output));
     }
 
-    let system_prompt = r#"You are a helpful terminal assistant in an app called Drover. The user asked a question, commands were executed, and you now have the output. Summarize the results in a clear, concise, human-readable way.
+    let system_prompt = r#"You are a friendly, knowledgeable assistant in a terminal app called Drover. The user asked a question, commands were executed, and you now have the output. Give a clear, conversational answer.
 
 Rules:
-- Be concise and direct. Use short paragraphs or bullet points.
-- Highlight the most important findings first.
-- If there are DNS records, format them cleanly (type, value, TTL).
-- If there are errors in the output, mention them clearly.
-- Do NOT repeat the raw command output verbatim — summarize it.
-- Do NOT use markdown code fences. Use plain text.
-- Mention which commands were run, briefly, at the end if relevant."#;
+- Answer the user's question directly and naturally, as if talking to them.
+- Lead with the key answer or finding — don't bury it.
+- Use short paragraphs. Use bullet points only when listing multiple items.
+- For structured data (DNS, system info, etc.), present it cleanly with labels.
+- If something failed or errored, explain what went wrong and suggest alternatives.
+- Keep it concise but complete — don't be terse, be helpful.
+- Do NOT use markdown code fences or backticks.
+- Do NOT repeat raw command output verbatim.
+- Do NOT mention which commands were run unless the user asked about commands."#;
 
     let user_content = format!(
         "Original question: {}\n\nCommand outputs:\n{}",
@@ -426,6 +428,122 @@ Rules:
     Ok(result)
 }
 
+#[derive(Deserialize)]
+pub struct FailedAttempt {
+    pub command: String,
+    pub error: String,
+}
+
+#[tauri::command]
+pub async fn ai_retry(
+    account_id: String,
+    api_token: String,
+    original_prompt: String,
+    failed_attempts: Vec<FailedAttempt>,
+    cwd: Option<String>,
+    os_info: Option<String>,
+    shell: Option<String>,
+    ssh_target: Option<String>,
+) -> Result<String, String> {
+    let mut context_lines = Vec::new();
+    if let Some(ref c) = cwd {
+        context_lines.push(format!("Current directory: {}", c));
+    }
+    if let Some(ref o) = os_info {
+        context_lines.push(format!("OS: {}", o));
+    }
+    if let Some(ref s) = shell {
+        context_lines.push(format!("Shell: {}", s));
+    }
+    if let Some(ref t) = ssh_target {
+        context_lines.push(format!("Connected via SSH to: {}", t));
+    }
+
+    let context_block = if context_lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nCurrent environment:\n{}", context_lines.join("\n"))
+    };
+
+    let mut attempts_block = String::new();
+    for (i, attempt) in failed_attempts.iter().enumerate() {
+        attempts_block.push_str(&format!(
+            "Attempt {}:\n  Command: {}\n  Error: {}\n\n",
+            i + 1,
+            attempt.command,
+            attempt.error
+        ));
+    }
+
+    let system_prompt = format!(
+        r#"You are an expert terminal assistant in Drover. A previous command failed. Analyze the error and respond with an alternative command that accomplishes the same goal.
+
+Rules:
+- Respond with ONLY executable shell commands (one per line), OR a single line starting with ANSWER: if the task needs no commands (e.g. math, general knowledge).
+- If the error indicates the command/tool is not available, use an alternative tool or approach that achieves the same result.
+- If the error is a permissions issue, suggest the appropriate fix (e.g. Run As Administrator, sudo).
+- If the task is simply impossible in this environment, respond with: ERROR: <clear explanation of why and what the user can do instead>
+- No explanations, no markdown, no code fences.
+- Do NOT retry the exact same command that already failed.{}"#,
+        context_block
+    );
+
+    let user_content = format!(
+        "Original request: {}\n\nFailed attempts:\n{}Provide an alternative approach.",
+        original_prompt, attempts_block
+    );
+
+    let messages = vec![
+        AiMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        AiMessage {
+            role: "user".to_string(),
+            content: user_content,
+        },
+    ];
+
+    let body = AiRequest {
+        messages,
+        max_tokens: 2048,
+    };
+
+    let url = AI_MODEL_URL.replace("{}", &account_id);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("AI retry request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("AI error {}: {}", status, text));
+    }
+
+    let ai_resp: AiResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse AI response: {}", e))?;
+
+    if !ai_resp.success {
+        return Err(format!("AI API failed: {:?}", ai_resp.errors));
+    }
+
+    ai_resp
+        .result
+        .and_then(|r| r.response)
+        .ok_or_else(|| "No AI response".to_string())
+}
+
 #[tauri::command]
 pub async fn ai_summarize_tool_results(
     account_id: String,
@@ -451,16 +569,18 @@ pub async fn ai_summarize_tool_results(
         results_block.push_str(&format!("$ {}\n{}\n\n", cr.command, cr.output));
     }
 
-    let system_prompt = r#"You are a helpful terminal assistant in an app called Drover. The user asked a question, and tools/commands were executed to get the answer. Summarize the results clearly and concisely.
+    let system_prompt = r#"You are a friendly, knowledgeable assistant in a terminal app called Drover. The user asked a question, and tools/commands were executed to get the answer. Give a clear, conversational answer.
 
 Rules:
-- Be concise and direct. Use short paragraphs or bullet points.
-- Highlight the most important findings first.
-- Format structured data clearly with relevant details.
-- If there are errors, mention them clearly.
-- Do NOT repeat raw JSON output verbatim — extract and present the key information.
-- Do NOT use markdown code fences. Use plain text.
-- Format lists cleanly with dashes or bullets."#;
+- Answer the user's question directly and naturally, as if talking to them.
+- Lead with the key answer or finding — don't bury it.
+- Use short paragraphs. Use bullet points only when listing multiple items.
+- For structured data, present it cleanly with labels.
+- If something failed or errored, explain what went wrong and suggest alternatives.
+- Keep it concise but complete — don't be terse, be helpful.
+- Do NOT use markdown code fences or backticks.
+- Do NOT repeat raw JSON or command output verbatim — extract key information.
+- Do NOT mention which commands were run unless the user asked about commands."#;
 
     let user_content = format!(
         "Original question: {}\n\nResults:\n{}",
