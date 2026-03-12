@@ -1,3 +1,5 @@
+use tauri_plugin_frame::FramePluginBuilder;
+
 mod ai;
 mod files;
 mod mcp;
@@ -34,6 +36,14 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(state)
+        .plugin(
+            FramePluginBuilder::new()
+                .titlebar_height(44)
+                .button_width(46)
+                .auto_titlebar(true)
+                .button_hover_bg("rgba(255,255,255,0.08)")
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .setup(|app| {
@@ -84,7 +94,8 @@ pub fn run() {
             mcp::mcp_list_tools,
             mcp::mcp_call_tool,
             ai::ai_chat_with_tools,
-            ai::ai_summarize_tool_results
+            ai::ai_summarize_tool_results,
+            ai::ai_retry
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

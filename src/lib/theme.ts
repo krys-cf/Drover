@@ -45,19 +45,55 @@ export function applyThemeCssVars(theme: TerminalTheme) {
 }
 
 export function highlightPrompt(lineText: string, theme: TerminalTheme): { text: string; color: string }[] | null {
+  // Unix-style prompt: user@host path %
   const match = lineText.match(/^(\S+)(@)(\S+)\s+(.+?)\s+(%)\s*(.*)$/);
-  if (!match) return null;
-  return [
-    { text: match[1], color: theme.promptUser },
-    { text: match[2], color: theme.promptHost },
-    { text: match[3], color: theme.promptHost },
-    { text: ' ', color: '' },
-    { text: match[4], color: theme.promptPath },
-    { text: ' ', color: '' },
-    { text: match[5], color: theme.promptSymbol },
-    { text: ' ', color: '' },
-    { text: match[6], color: theme.promptCommand },
-  ];
+  if (match) {
+    return [
+      { text: match[1], color: theme.promptUser },
+      { text: match[2], color: theme.promptHost },
+      { text: match[3], color: theme.promptHost },
+      { text: ' ', color: '' },
+      { text: match[4], color: theme.promptPath },
+      { text: ' ', color: '' },
+      { text: match[5], color: theme.promptSymbol },
+      { text: ' ', color: '' },
+      { text: match[6], color: theme.promptCommand },
+    ];
+  }
+  // PowerShell-style prompt: PS C:\path>
+  const psMatch = lineText.match(/^(PS)\s+(.+?)(>)\s*(.*)$/);
+  if (psMatch) {
+    return [
+      { text: psMatch[1], color: theme.promptUser },
+      { text: ' ', color: '' },
+      { text: psMatch[2], color: theme.promptPath },
+      { text: psMatch[3], color: theme.promptSymbol },
+      { text: ' ', color: '' },
+      { text: psMatch[4], color: theme.promptCommand },
+    ];
+  }
+  // cmd.exe-style prompt: C:\path>
+  const cmdMatch = lineText.match(/^([A-Za-z]:\\.+?)(>)\s*(.*)$/);
+  if (cmdMatch) {
+    return [
+      { text: cmdMatch[1], color: theme.promptPath },
+      { text: cmdMatch[2], color: theme.promptSymbol },
+      { text: ' ', color: '' },
+      { text: cmdMatch[3], color: theme.promptCommand },
+    ];
+  }
+  return null;
+}
+
+/** Check if a line is a shell prompt with no command text after the symbol (i.e. shell is idle) */
+export function isBarePrompt(lineText: string): boolean {
+  // Unix: user@host path % (nothing after %)
+  if (/^(\S+)@(\S+)\s+.+?\s+%\s*$/.test(lineText)) return true;
+  // PowerShell: PS C:\path> (nothing after >)
+  if (/^PS\s+.+?>\s*$/.test(lineText)) return true;
+  // cmd.exe: C:\path> (nothing after >)
+  if (/^[A-Za-z]:\\.+?>\s*$/.test(lineText)) return true;
+  return false;
 }
 
 // ── Semantic output highlighting ──

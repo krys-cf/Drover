@@ -31,6 +31,7 @@ tauri-plugin-stronghold = "2.3.1"
 base64 = "0.22"
 dirs = "5"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+tauri-plugin-frame = "1.1.2"
 
 [profile.dev.package.scrypt]
 opt-level = 3

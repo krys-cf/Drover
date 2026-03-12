@@ -149,14 +149,17 @@
   }
 
   async function navigateUp() {
-    if (root === '/' || root === '~') {
+    // Windows drive root like C:/
+    if (/^[A-Za-z]:\/?$/.test(root) || root === '/' || root === '~') {
       if (root === '~') {
         root = '/';
       }
     } else {
       const parts = root.split('/');
       parts.pop();
+      // Preserve drive root on Windows (e.g. C:/ not C:)
       root = parts.join('/') || '/';
+      if (/^[A-Za-z]:$/.test(root)) root += '/';
     }
     await loadRoot();
     onNavigate(root);
