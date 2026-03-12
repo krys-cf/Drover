@@ -77,6 +77,9 @@ pub fn run() {
             files::rename_path,
             files::delete_path,
             files::copy_path,
+            files::select_files_dialog,
+            files::read_file_text,
+            files::search_files,
             shell::detect_ssh,
             tools::dig_domain,
             tools::dig_trace,
@@ -95,7 +98,9 @@ pub fn run() {
             mcp::mcp_call_tool,
             ai::ai_chat_with_tools,
             ai::ai_summarize_tool_results,
-            ai::ai_retry
+            ai::ai_retry,
+            ai::ai_edit_code,
+            ai::ai_edit_code_from_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

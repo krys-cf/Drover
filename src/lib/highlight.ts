@@ -409,6 +409,37 @@ export function highlightToHtml(code: string, language: string): string {
   return `<pre class="hl-pre"><code class="hl-code">${parts.join('')}</code></pre>`;
 }
 
+export function highlight(code: string, language: string): string {
+  const lang = language.toLowerCase();
+  const langRules = LANG_RULES[lang];
+
+  if (!langRules) {
+    return escapeHtml(code);
+  }
+
+  const tokens = tokenize(code, langRules);
+  const parts: string[] = [];
+  let pos = 0;
+
+  for (const t of tokens) {
+    if (t.start > pos) {
+      parts.push(escapeHtml(code.slice(pos, t.start)));
+    }
+    const color = TOKEN_COLORS[t.type] || '';
+    if (color) {
+      parts.push(`<span style="color:${color}">${escapeHtml(code.slice(t.start, t.end))}</span>`);
+    } else {
+      parts.push(escapeHtml(code.slice(t.start, t.end)));
+    }
+    pos = t.end;
+  }
+  if (pos < code.length) {
+    parts.push(escapeHtml(code.slice(pos)));
+  }
+
+  return parts.join('');
+}
+
 export function highlightLines(code: string, language: string): string {
   const lang = language.toLowerCase();
   const langRules = LANG_RULES[lang];

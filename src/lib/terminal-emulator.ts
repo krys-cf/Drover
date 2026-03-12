@@ -118,6 +118,12 @@ export class TerminalEmulator {
   // Max scrollback lines
   private maxScrollback = 5000;
 
+  // Track how many lines have been dropped from scrollback to calculate absolute indices
+  linesDropped = 0;
+
+  // Set of absolute line indices that should not be rendered
+  hiddenAbsoluteLines = new Set<number>();
+
   // Mouse tracking modes (set by TUI apps via DECSET)
   mouseTrackingMode: 'none' | 'normal' | 'button' | 'any' = 'none';
   mouseSgrMode = false;  // SGR extended mouse encoding (1006)
@@ -346,6 +352,7 @@ export class TerminalEmulator {
       this.primaryScrollback.push(buf[this.scrollTop]);
       if (this.primaryScrollback.length > this.maxScrollback) {
         this.primaryScrollback.shift();
+        this.linesDropped++;
       }
     }
     // Shift lines up within scroll region
@@ -793,23 +800,25 @@ export class TerminalEmulator {
     }
     return lines;
   }
-
-  /**
-   * Get scrollback + visible buffer as plain text lines (for normal mode rendering).
-   * Trims trailing whitespace from each line.
-   */
   getScrollbackLines(): { text: string; style: CellStyle }[][] {
     const lines: { text: string; style: CellStyle }[][] = [];
 
     // Scrollback
+    let absoluteIdx = this.linesDropped;
     for (const row of this.primaryScrollback) {
-      lines.push(rowToRuns(row, this.cols));
+      if (!this.hiddenAbsoluteLines.has(absoluteIdx)) {
+        lines.push(rowToRuns(row, this.cols));
+      }
+      absoluteIdx++;
     }
 
     // Current visible buffer
     for (let r = 0; r < this.rows; r++) {
       const row = this.primaryBuffer[r];
-      if (row) lines.push(rowToRuns(row, this.cols));
+      if (row && !this.hiddenAbsoluteLines.has(absoluteIdx)) {
+        lines.push(rowToRuns(row, this.cols));
+      }
+      absoluteIdx++;
     }
 
     // Trim trailing empty rows so content builds from bottom up
@@ -821,6 +830,40 @@ export class TerminalEmulator {
     }
 
     return lines;
+  }
+
+  /**
+   * Get all lines including hidden ones (used for AI output extraction)
+   */
+  getRawLines(): { text: string; style: CellStyle }[][] {
+    const lines: { text: string; style: CellStyle }[][] = [];
+
+    for (const row of this.primaryScrollback) {
+      lines.push(rowToRuns(row, this.cols));
+    }
+    for (let r = 0; r < this.rows; r++) {
+      const row = this.primaryBuffer[r];
+      if (row) lines.push(rowToRuns(row, this.cols));
+    }
+
+    while (lines.length > 0) {
+      const last = lines[lines.length - 1];
+      const isEmpty = last.length === 0 || (last.length === 1 && last[0].text.trim() === '');
+      if (isEmpty) lines.pop();
+      else break;
+    }
+
+    return lines;
+  }
+
+  getCurrentAbsoluteLine(): number {
+    return this.linesDropped + this.primaryScrollback.length + this.cursorRow;
+  }
+
+  hideLineRange(start: number, end: number) {
+    for (let i = start; i <= end; i++) {
+      this.hiddenAbsoluteLines.add(i);
+    }
   }
 }
 

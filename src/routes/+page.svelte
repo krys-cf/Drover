@@ -23,6 +23,7 @@
   import PortScanApp from '$lib/components/PortScanApp.svelte';
   import McpExplorer from '$lib/components/McpExplorer.svelte';
   import PaneLayout from '$lib/components/PaneLayout.svelte';
+  import DiffViewer from '$lib/components/DiffViewer.svelte';
   import { createInitialLayout, splitPane, closePane, getAllLeaves, findPane, swapPanes, deepCloneNode, type PaneLayout as PaneLayoutType, type PaneLeaf, type PaneNode, type PaneContainer } from '$lib/pane-layout';
 
   let charWidth = 7.22;
@@ -228,6 +229,47 @@
   let aiExecMode = $state<'auto' | 'manual' | null>(null);
   let aiExecPromptShown = $state(false);
   let currentView = $state<'terminal' | 'settings'>('terminal');
+  
+  // AI attachments and model selection
+  interface AiAttachment {
+    name: string;
+    path: string;
+    content: string;
+    mimeType: string;
+  }
+  let aiAttachments = $state<AiAttachment[]>([]);
+  let aiModelDropdownOpen = $state(false);
+  let selectedAiModel = $state('@cf/meta/llama-4-scout-17b-16e-instruct');
+  
+  // Code editing state
+  interface DiffLine {
+    tag: string;
+    content: string;
+    old_line: number | null;
+    new_line: number | null;
+  }
+  interface CodeEditResult {
+    file_name: string;
+    file_path: string | null;
+    original: string;
+    modified: string;
+    diff_lines: DiffLine[];
+    summary: string;
+  }
+  let pendingCodeEdit = $state<CodeEditResult | null>(null);
+  let applyingCodeEdit = $state(false);
+  
+  const CLOUDFLARE_AI_MODELS = [
+    { id: '@cf/meta/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout (17B)', description: 'Fast, efficient model' },
+    { id: '@cf/meta/llama-3.1-8b-instruct', name: 'Llama 3.1 (8B)', description: 'Balanced performance' },
+    { id: '@cf/meta/llama-3.1-70b-instruct', name: 'Llama 3.1 (70B)', description: 'High quality responses' },
+    { id: '@cf/meta/llama-3.2-3b-instruct', name: 'Llama 3.2 (3B)', description: 'Lightweight and fast' },
+    { id: '@cf/meta/llama-3.2-11b-vision-instruct', name: 'Llama 3.2 Vision (11B)', description: 'Vision + text understanding' },
+    { id: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', name: 'Llama 3.3 (70B) Fast', description: 'Optimized for speed' },
+    { id: '@cf/qwen/qwen2.5-14b-instruct', name: 'Qwen 2.5 (14B)', description: 'Strong reasoning' },
+    { id: '@cf/qwen/qwen2.5-72b-instruct', name: 'Qwen 2.5 (72B)', description: 'Advanced reasoning' },
+    { id: '@cf/deepseek-ai/deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 (70B)', description: 'Reasoning specialist' },
+  ];
 
   const ERROR_PATTERNS = [
     /is not recognized as the name of a cmdlet/i,
@@ -271,7 +313,7 @@
     const base = firstWord.split('/').pop() || firstWord;
     return PASSTHROUGH_CMDS.has(base);
   }
-  let rightPane = $state<'editor' | 'preview' | 'markdown' | null>(null);
+  let rightPane = $state<'editor' | 'preview' | 'markdown' | 'diff' | null>(null);
   let activeTool = $state<string | null>(null);
   let toolsDropdownOpen = $state(false);
 
@@ -324,6 +366,14 @@
   let slashMenuIndex = $state(0);
   let slashFilter = $state('');
 
+  // @ mention file picker state
+  interface FileSuggestion { name: string; path: string; isDir: boolean; }
+  let atMenuOpen = $state(false);
+  let atMenuIndex = $state(0);
+  let atFilter = $state('');
+  let atFileSuggestions: FileSuggestion[] = $state([]);
+  let atMenuLoading = $state(false);
+
   // MCP Servers manager
   interface McpServerEntry { name: string; server_url: string; auth_token?: string; auth_command?: string; }
   let mcpServers: McpServerEntry[] = $state([]);
@@ -342,13 +392,19 @@
     return themeHighlightPrompt(lineText, getTheme());
   }
 
-  const INTERACTIVE_PROMPT_RE = /(password|passphrase|otp|verification code|auth(?:entication)? code|token|2fa|two-factor|enter .*:|username|login|do you want to continue|continue\?|proceed\?|yes to all|no to all|default is|selection:|\[y\] yes|\[a\] yes to all|\[n\] no|\[l\] no to all|\[s\] suspend|\[\?\] help|\[y\/n\]|\[y\/N\]|\(y\/n\)|press enter)/i;
+  const INTERACTIVE_PROMPT_RE = /\b(password|passphrase|otp|verification code|auth(?:entication)? code|token|2fa|two-factor|username|login)\s*[:>]\s*$|\b(do you want to continue|continue\?|proceed\?|yes to all|no to all|default is|selection:|\[y\] yes|\[a\] yes to all|\[n\] no|\[l\] no to all|\[s\] suspend|\[\?\] help|\[y\/n\]|\[y\/N\]|\(y\/n\)|press enter)\b/i;
 
   function isLikelyInteractivePrompt(lineText: string): boolean {
     const t = lineText.trim();
     if (!t) return false;
+    // Don't treat raw HTML/XML tags or attributes as prompts
+    if (t.endsWith('>') || t.endsWith('="') || t.endsWith("='")) return false;
+    
     if (INTERACTIVE_PROMPT_RE.test(t)) return true;
-    if (/[:?]$/.test(t) && t.length <= 120 && !highlightPrompt(t)) return true;
+    
+    // Check for standard prompt endings like ':', '?', or '> '
+    if (/[:?]$/.test(t) && t.length <= 80 && !highlightPrompt(t)) return true;
+    
     return false;
   }
 
@@ -566,6 +622,99 @@
     slashMenuOpen = false;
     slashFilter = '';
     slashMenuIndex = 0;
+  }
+
+  function closeAtMenu() {
+    atMenuOpen = false;
+    atFilter = '';
+    atMenuIndex = 0;
+    atFileSuggestions = [];
+  }
+
+  async function searchFilesForAtMenu(query: string) {
+    const tab = focusedTab();
+    if (!tab || !query) {
+      atFileSuggestions = [];
+      return;
+    }
+    
+    atMenuLoading = true;
+    try {
+      // Use fd/find to search for files matching the query in cwd
+      const cwd = tab.cwd || '~';
+      const results = await invoke<{ name: string; is_dir: boolean; path: string }[]>('search_files', {
+        directory: cwd,
+        pattern: query,
+        maxResults: 10,
+      });
+      atFileSuggestions = results.map(r => ({ name: r.name, path: r.path, isDir: r.is_dir }));
+    } catch (e) {
+      console.error('File search failed:', e);
+      atFileSuggestions = [];
+    }
+    atMenuLoading = false;
+  }
+
+  async function selectAtFile(file: FileSuggestion) {
+    if (file.isDir) {
+      // If directory, update filter to show contents
+      atFilter = file.name + '/';
+      searchFilesForAtMenu(atFilter);
+      return;
+    }
+    
+    const tab = focusedTab();
+    if (!tab) return;
+    
+    // Read file content and add to attachments
+    try {
+      let content: string;
+      if (tab.sshTarget) {
+        content = await invoke<string>('read_remote_file', { sshTarget: tab.sshTarget, path: file.path });
+      } else {
+        content = await invoke<string>('read_file_contents', { path: file.path });
+      }
+      
+      // Determine MIME type
+      const ext = file.name.split('.').pop()?.toLowerCase() || '';
+      const mimeMap: Record<string, string> = {
+        ts: 'text/typescript', tsx: 'text/typescript',
+        js: 'text/javascript', jsx: 'text/javascript',
+        rs: 'text/rust', py: 'text/python', go: 'text/go',
+        svelte: 'text/svelte', vue: 'text/vue',
+        html: 'text/html', css: 'text/css', scss: 'text/scss',
+        json: 'application/json', yaml: 'text/yaml', yml: 'text/yaml',
+        toml: 'text/toml', md: 'text/markdown', mdx: 'text/markdown',
+        sh: 'text/x-shellscript', bash: 'text/x-shellscript',
+        sql: 'text/sql', xml: 'text/xml', txt: 'text/plain',
+      };
+      const mimeType = mimeMap[ext] || 'text/plain';
+      
+      // Add to attachments (avoid duplicates)
+      const existing = aiAttachments.find(a => a.path === file.path);
+      if (!existing) {
+        aiAttachments = [...aiAttachments, {
+          name: file.name,
+          path: file.path,
+          content,
+          mimeType,
+        }];
+      }
+      
+      // Remove the @query from input (e.g., "@inde" becomes "")
+      const val = tab.inputValue;
+      const atIndex = val.lastIndexOf('@');
+      if (atIndex >= 0) {
+        tab.inputValue = val.slice(0, atIndex);
+        // Force reactive update
+        tabs = [...tabs];
+      }
+      
+      closeAtMenu();
+      focusInput();
+    } catch (e) {
+      console.error('Failed to read file:', e);
+    }
   }
 
   async function saveMcpServers() {
@@ -893,6 +1042,53 @@
     mdPreviewRef?.openFile(entry.path, entry.name);
   }
 
+  async function addFileToChat(entry: FileEntry) {
+    if (entry.is_dir) return;
+    const tab = focusedTab();
+    if (!tab) return;
+    
+    try {
+      // Read file content
+      let content: string;
+      if (tab.sshTarget) {
+        content = await invoke<string>('read_remote_file', { sshTarget: tab.sshTarget, path: entry.path });
+      } else {
+        content = await invoke<string>('read_file_contents', { path: entry.path });
+      }
+      
+      // Determine MIME type from extension
+      const ext = entry.name.split('.').pop()?.toLowerCase() || '';
+      const mimeMap: Record<string, string> = {
+        ts: 'text/typescript', tsx: 'text/typescript',
+        js: 'text/javascript', jsx: 'text/javascript',
+        rs: 'text/rust', py: 'text/python', go: 'text/go',
+        svelte: 'text/svelte', vue: 'text/vue',
+        html: 'text/html', css: 'text/css', scss: 'text/scss',
+        json: 'application/json', yaml: 'text/yaml', yml: 'text/yaml',
+        toml: 'text/toml', md: 'text/markdown', mdx: 'text/markdown',
+        sh: 'text/x-shellscript', bash: 'text/x-shellscript',
+        sql: 'text/sql', xml: 'text/xml', txt: 'text/plain',
+      };
+      const mimeType = mimeMap[ext] || 'text/plain';
+      
+      // Add to attachments (avoid duplicates)
+      const existing = aiAttachments.find(a => a.path === entry.path);
+      if (!existing) {
+        aiAttachments = [...aiAttachments, {
+          name: entry.name,
+          path: entry.path,
+          content,
+          mimeType,
+        }];
+      }
+      
+      // Focus the input
+      focusInput();
+    } catch (e) {
+      console.error('Failed to add file to chat:', e);
+    }
+  }
+
   function closeMarkdownPreview() {
     rightPane = null;
     mdPreviewFilePath = '';
@@ -923,6 +1119,47 @@
     rightPane = 'markdown';
     activeTool = null;
     tick().then(() => mdPreviewRef?.openFile(path, name));
+  }
+
+  function openDiffViewer() {
+    rightPane = 'diff';
+    activeTool = null;
+  }
+
+  function closeDiffViewer() {
+    rightPane = null;
+    pendingCodeEdit = null;
+    applyingCodeEdit = false;
+    tick().then(() => focusInput());
+  }
+
+  async function applyCodeEdit() {
+    if (!pendingCodeEdit) return;
+    
+    applyingCodeEdit = true;
+    try {
+      const filePath = pendingCodeEdit.file_path;
+      if (filePath) {
+        // Write to file system
+        await invoke('write_file_contents', {
+          path: filePath,
+          contents: pendingCodeEdit.modified,
+        });
+        console.log('[AI Edit] Applied changes to:', filePath);
+      } else {
+        // No file path - copy to clipboard instead
+        await navigator.clipboard.writeText(pendingCodeEdit.modified);
+        console.log('[AI Edit] Copied modified code to clipboard');
+      }
+      closeDiffViewer();
+    } catch (e) {
+      console.error('[AI Edit] Failed to apply changes:', e);
+      applyingCodeEdit = false;
+    }
+  }
+
+  function rejectCodeEdit() {
+    closeDiffViewer();
   }
 
   // Clickable file detection in terminal output
@@ -1067,6 +1304,7 @@
   let previewFileName = $state('');
   let previewSshTarget = $state('');
   let previewLoading = $state(false);
+  
 
   function closePreview() {
     rightPane = null;
@@ -1145,14 +1383,107 @@
     editorViewRef?.openFile(fullPath, fileName);
   }
 
+  // Terminal file context menu state
+  let terminalFileCtxMenu: { x: number; y: number; filePath: string; fileName: string; tab: Tab } | null = $state(null);
+
+  function handleTerminalFileContextMenu(e: MouseEvent, tab: Tab) {
+    const target = e.target as HTMLElement;
+    if (!target || !target.classList.contains('terminal-run')) return;
+    const rawText = target.textContent || '';
+    let text = rawText.trim();
+
+    if (text && !looksLikeFile(text)) {
+      const rect = target.getBoundingClientRect();
+      const offsetX = e.clientX - rect.left;
+      const word = getWordAtOffset(rawText, offsetX, target);
+      if (word && looksLikeFile(word)) {
+        text = word;
+      } else {
+        return;
+      }
+    }
+    if (!text) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const cwd = tab.cwd || '~';
+    const fullPath = text.startsWith('/') ? text : (cwd.endsWith('/') ? cwd + text : cwd + '/' + text);
+    const fileName = text.split('/').pop() || text;
+
+    terminalFileCtxMenu = { x: e.clientX, y: e.clientY, filePath: fullPath, fileName, tab };
+  }
+
+  function closeTerminalFileCtxMenu() {
+    terminalFileCtxMenu = null;
+  }
+
+  async function addTerminalFileToAgent() {
+    if (!terminalFileCtxMenu) return;
+    const { filePath, fileName, tab } = terminalFileCtxMenu;
+    closeTerminalFileCtxMenu();
+
+    try {
+      let content: string;
+      if (tab.sshTarget) {
+        content = await invoke<string>('read_remote_file', { sshTarget: tab.sshTarget, path: filePath });
+      } else {
+        content = await invoke<string>('read_file_contents', { path: filePath });
+      }
+
+      const ext = fileName.split('.').pop()?.toLowerCase() || '';
+      const mimeMap: Record<string, string> = {
+        ts: 'text/typescript', tsx: 'text/typescript',
+        js: 'text/javascript', jsx: 'text/javascript',
+        rs: 'text/rust', py: 'text/python', go: 'text/go',
+        svelte: 'text/svelte', vue: 'text/vue',
+        html: 'text/html', css: 'text/css', scss: 'text/scss',
+        json: 'application/json', yaml: 'text/yaml', yml: 'text/yaml',
+        toml: 'text/toml', md: 'text/markdown', mdx: 'text/markdown',
+        sh: 'text/x-shellscript', bash: 'text/x-shellscript',
+        sql: 'text/sql', xml: 'text/xml', txt: 'text/plain',
+      };
+      const mimeType = mimeMap[ext] || 'text/plain';
+
+      const existing = aiAttachments.find(a => a.path === filePath);
+      if (!existing) {
+        aiAttachments = [...aiAttachments, {
+          name: fileName,
+          path: filePath,
+          content,
+          mimeType,
+        }];
+      }
+
+      // Switch to agent mode if not already
+      if (!agenticMode) {
+        if (!aiAccountId || !aiApiToken) {
+          openSettings();
+          return;
+        }
+        agenticMode = true;
+      }
+
+      focusInput();
+    } catch (e) {
+      console.error('Failed to add file to agent:', e);
+    }
+  }
+
   // AI overlay — multiple blocks per tab (history + active)
   let aiBlockIdCounter = 0;
   interface AiCmdEntry { text: string; status: 'pending' | 'running' | 'done' | 'error' | 'input'; output: string }
   interface AiToolCallEntry { serverName: string; toolName: string; arguments: string; status: 'pending' | 'running' | 'done' | 'error'; output: string }
+  interface AiBlockAttachment {
+    name: string;
+    content: string;  // base64 for images
+    mimeType: string;
+  }
   interface AiBlock {
     id: number;
     tabId: string;
     prompt: string;
+    attachments: AiBlockAttachment[];  // Store images/files with the prompt
     phase: 'choosing' | 'thinking' | 'commands' | 'executing' | 'retrying' | 'needs_input' | 'done' | 'error' | 'answered';
     commands: AiCmdEntry[];
     toolCalls: AiToolCallEntry[];
@@ -1177,7 +1508,19 @@
     return aiBlocks.findLast(b => b.tabId === tabId && b.phase !== 'done' && b.phase !== 'error' && b.phase !== 'answered') ?? null;
   }
   function createAiBlock(tabId: string, data: Partial<AiBlock>): AiBlock {
-    const block: AiBlock = { id: ++aiBlockIdCounter, tabId, prompt: '', phase: 'thinking', commands: [], toolCalls: [], error: '', raw: '', response: '', ...data };
+    const block: AiBlock = { 
+      id: ++aiBlockIdCounter, 
+      tabId, 
+      prompt: '', 
+      attachments: data.attachments ?? [], 
+      phase: 'thinking', 
+      commands: [], 
+      toolCalls: [], 
+      error: '', 
+      raw: '', 
+      response: '', 
+      ...data 
+    };
     aiBlocks = [...aiBlocks, block];
     return block;
   }
@@ -1217,6 +1560,112 @@
     }
   }
 
+  async function handleAttachFile() {
+    try {
+      const selected = await invoke<string[]>('select_files_dialog');
+      if (!selected || selected.length === 0) return;
+      
+      for (const filePath of selected) {
+        const fileName = filePath.split('/').pop() || filePath;
+        
+        // Check if already attached
+        if (aiAttachments.some(a => a.path === filePath)) continue;
+        
+        // Determine mime type
+        const ext = getFileExt(fileName);
+        let mimeType = 'text/plain';
+        if (IMAGE_EXTS.has(ext)) {
+          mimeType = ext === 'svg' ? 'image/svg+xml' : `image/${ext === 'jpg' ? 'jpeg' : ext}`;
+        } else if (ext === 'pdf') {
+          mimeType = 'application/pdf';
+        } else if (ext === 'json') {
+          mimeType = 'application/json';
+        }
+        
+        // Read file content as base64
+        let content: string;
+        if (IMAGE_EXTS.has(ext) || ext === 'pdf') {
+          content = await invoke('read_file_base64', { path: filePath });
+        } else {
+          // Read as text
+          content = await invoke('read_file_text', { path: filePath });
+        }
+        
+        aiAttachments = [...aiAttachments, { name: fileName, path: filePath, content, mimeType }];
+      }
+    } catch (e) {
+      console.error('Failed to attach file:', e);
+    }
+  }
+
+  function removeAttachment(index: number) {
+    aiAttachments = aiAttachments.filter((_, i) => i !== index);
+  }
+
+  function clearAllAttachments() {
+    aiAttachments = [];
+  }
+
+  function selectAiModel(modelId: string) {
+    selectedAiModel = modelId;
+    aiModelDropdownOpen = false;
+  }
+
+  function getSelectedModelName(): string {
+    return CLOUDFLARE_AI_MODELS.find(m => m.id === selectedAiModel)?.name || 'Llama 4 Scout';
+  }
+
+  async function handlePaste(e: ClipboardEvent) {
+    if (!agenticMode) return;
+    
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      
+      // Check if it's an image
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        
+        const blob = item.getAsFile();
+        if (!blob) continue;
+        
+        try {
+          // Convert blob to base64
+          const reader = new FileReader();
+          const base64Promise = new Promise<string>((resolve, reject) => {
+            reader.onloadend = () => {
+              const result = reader.result as string;
+              // Remove data URL prefix to get just the base64 data
+              const base64 = result.split(',')[1];
+              resolve(base64);
+            };
+            reader.onerror = reject;
+          });
+          
+          reader.readAsDataURL(blob);
+          const content = await base64Promise;
+          
+          // Generate a unique filename for the pasted image
+          const timestamp = Date.now();
+          const ext = item.type.split('/')[1] || 'png';
+          const fileName = `pasted-image-${timestamp}.${ext}`;
+          
+          // Add to attachments
+          aiAttachments = [...aiAttachments, {
+            name: fileName,
+            path: fileName, // Use filename as path for pasted images
+            content,
+            mimeType: item.type,
+          }];
+        } catch (err) {
+          console.error('Failed to process pasted image:', err);
+        }
+      }
+    }
+  }
+
   async function handleAgenticSubmit() {
     const tab = focusedTab();
     if (!tab || !tab.inputValue.trim() || !tab.connected) return;
@@ -1243,7 +1692,9 @@
       tab.inputValue = '';
       resetInputHeight(tab.id);
       aiExecPromptShown = true;
-      const block = createAiBlock(tab.id, { prompt: input, phase: 'choosing' });
+      // Store attachments with the block for history
+      const blockAttachments = aiAttachments.map(a => ({ name: a.name, content: a.content, mimeType: a.mimeType }));
+      const block = createAiBlock(tab.id, { prompt: input, attachments: blockAttachments, phase: 'choosing' });
       activeBlockId = block.id;
       scrollToBottom();
       return;
@@ -1251,24 +1702,121 @@
 
     tab.inputValue = '';
     resetInputHeight(tab.id);
-    const block = createAiBlock(tab.id, { prompt: input, phase: 'thinking' });
+    // Store attachments with the block for history
+    const blockAttachments = aiAttachments.map(a => ({ name: a.name, content: a.content, mimeType: a.mimeType }));
+    const block = createAiBlock(tab.id, { prompt: input, attachments: blockAttachments, phase: 'thinking' });
     activeBlockId = block.id;
     scrollToBottom();
     aiLoading = true;
+
+    // Check if this is a code modification request with a text file attachment
+    const promptLower = input.toLowerCase();
+    const isModificationRequest = promptLower.includes('add') || promptLower.includes('modify') || 
+      promptLower.includes('change') || promptLower.includes('update') || promptLower.includes('fix') ||
+      promptLower.includes('refactor') || promptLower.includes('implement') || promptLower.includes('create') ||
+      promptLower.includes('remove') || promptLower.includes('delete') || promptLower.includes('rename');
+    
+    const textFileAttachment = aiAttachments.find(a => 
+      !a.mimeType.startsWith('image/') && a.mimeType !== 'application/pdf'
+    );
+    
+    // Detect file paths in prompt (e.g., src/lib/foo.ts, ./bar.js, /path/to/file.rs)
+    const filePathRegex = /(?:^|\s)((?:\.{0,2}\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:ts|tsx|js|jsx|rs|py|go|svelte|vue|html|css|scss|json|yaml|yml|toml|md|mdx|sh|bash|sql|xml|txt|c|cpp|h|hpp|java|kt|swift|rb|php|lua|zig))(?:\s|$|[,;:])/gi;
+    const filePathMatches = input.match(filePathRegex);
+    const detectedFilePath = filePathMatches ? filePathMatches[0].trim().replace(/[,;:]$/, '') : null;
+    
+    // If modification request with text file attachment, use code edit flow
+    if (isModificationRequest && textFileAttachment) {
+      try {
+        console.log('[AI] Code edit request detected for:', textFileAttachment.name);
+        const editResult: CodeEditResult = await invoke('ai_edit_code', {
+          accountId: aiAccountId,
+          apiToken: aiApiToken,
+          model: selectedAiModel,
+          fileName: textFileAttachment.name,
+          filePath: textFileAttachment.path || null,
+          fileContent: textFileAttachment.content,
+          instruction: input,
+        });
+        
+        // Store the pending edit and show in diff viewer
+        pendingCodeEdit = editResult;
+        aiAttachments = [];
+        updateAiBlock(block.id, { 
+          phase: 'answered', 
+          response: `Code edit ready for review:\n${editResult.summary}`,
+          raw: 'CODE_EDIT'
+        });
+        aiLoading = false;
+        // Open the diff viewer pane
+        rightPane = 'diff';
+        activeTool = null;
+        scrollToBottom();
+        return;
+      } catch (e) {
+        updateAiBlock(block.id, { phase: 'error', error: `Code edit failed: ${e}` });
+        aiLoading = false;
+        scrollToBottom();
+        return;
+      }
+    }
+    
+    // If modification request with file path in prompt (no attachment), read from filesystem
+    if (isModificationRequest && detectedFilePath && !textFileAttachment) {
+      try {
+        console.log('[AI] Code edit from path detected:', detectedFilePath);
+        const editResult: CodeEditResult = await invoke('ai_edit_code_from_path', {
+          accountId: aiAccountId,
+          apiToken: aiApiToken,
+          model: selectedAiModel,
+          filePath: detectedFilePath,
+          instruction: input,
+          cwd: tab.cwd || null,
+        });
+        
+        // Store the pending edit and show in diff viewer
+        pendingCodeEdit = editResult;
+        updateAiBlock(block.id, { 
+          phase: 'answered', 
+          response: `Code edit ready for review:\n${editResult.summary}`,
+          raw: 'CODE_EDIT'
+        });
+        aiLoading = false;
+        // Open the diff viewer pane
+        rightPane = 'diff';
+        activeTool = null;
+        scrollToBottom();
+        return;
+      } catch (e) {
+        updateAiBlock(block.id, { phase: 'error', error: `Code edit failed: ${e}` });
+        aiLoading = false;
+        scrollToBottom();
+        return;
+      }
+    }
 
     // Step 1: Get commands/tool calls from AI (MCP-aware)
     const aiParams = {
       accountId: aiAccountId,
       apiToken: aiApiToken,
+      model: selectedAiModel,
       prompt: input,
+      attachments: aiAttachments.map(a => ({
+        name: a.name,
+        content: a.content,
+        mimeType: a.mimeType,
+      })),
       cwd: tab.cwd || null,
       osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
       shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
       sshTarget: tab.sshTarget || null,
     };
     let response: string;
+    console.log('[AI] Sending request with attachments:', aiParams.attachments.length, aiParams.attachments.map(a => ({ name: a.name, mimeType: a.mimeType, contentLen: a.content?.length })));
     try {
       response = await invoke('ai_chat_with_tools', aiParams);
+      // Clear attachments after successful request
+      aiAttachments = [];
     } catch (e) {
       updateAiBlock(block.id, { phase: 'error', error: `AI request failed: ${e}` });
       aiLoading = false;
@@ -1279,6 +1827,16 @@
     // Step 2: Parse response — separate TOOL_CALL lines from shell commands
     console.log('[ai_chat_with_tools] raw response:', response);
     const rawText = response.trim();
+    
+    // Handle direct answers (e.g., from vision model image analysis)
+    if (rawText.startsWith('ANSWER:')) {
+      const answerText = rawText.substring('ANSWER:'.length).trim();
+      updateAiBlock(block.id, { phase: 'answered', response: answerText, raw: rawText });
+      aiLoading = false;
+      scrollToBottom();
+      return;
+    }
+    
     const allLines = rawText.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#') && !l.startsWith('ERROR:'));
 
     if (allLines.length === 0 || rawText.startsWith('ERROR:')) {
@@ -1378,7 +1936,7 @@
           try {
             await invoke('write_to_shell', { sessionId: tab.sessionId, data: pendingCmds[i].text + '\r' });
             const timeout = tab.sshTarget ? 5000 : 2000;
-            const output = await waitForOutput(tab, linesBefore, timeout);
+            const output = await waitForOutput(tab, linesBefore, timeout, true);
             pendingCmds[i].output = output;
 
             const interactivePrompt = extractInteractivePrompt(output);
@@ -1515,15 +2073,16 @@
   }
 
   function getPlainLines(tab: Tab): string[] {
-    return tab.emulator.getScrollbackLines().map(
+    return tab.emulator.getRawLines().map(
       (row: { text: string }[]) => row.map(r => r.text).join('')
     );
   }
 
-  async function waitForOutput(tab: Tab, prevLineCount: number, timeoutMs = 2000): Promise<string> {
+  async function waitForOutput(tab: Tab, prevLineCount: number, timeoutMs = 2000, hideFromTerminal = false): Promise<string> {
     const start = Date.now();
     let lastCount = prevLineCount;
     let stableTime = 0;
+
     while (Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 150));
       if (tab.awaitingInput) break;
@@ -1536,15 +2095,42 @@
         if (stableTime >= 400) break;
       }
     }
+
+    // Get all new lines that appeared
     const allLines = getPlainLines(tab);
     const newLines = allLines.slice(prevLineCount);
-    // Trim trailing empty lines and the prompt line at the end
-    while (newLines.length > 0 && newLines[newLines.length - 1].trim() === '') newLines.pop();
-    if (newLines.length > 0) {
-      const last = newLines[newLines.length - 1];
-      if (last.includes('$') || last.includes('%') || last.includes('#') || /^PS .+>/.test(last.trim())) newLines.pop();
+    
+    // Hide the newly generated lines if requested
+    // We need to hide from the line AFTER prevLineCount (the command echo) to the current last line
+    if (hideFromTerminal && newLines.length > 0) {
+      const startAbsoluteLine = tab.emulator.linesDropped + prevLineCount;
+      const endAbsoluteLine = tab.emulator.linesDropped + allLines.length - 1;
+      tab.emulator.hideLineRange(startAbsoluteLine, endAbsoluteLine);
+      tab.renderVersion++;
     }
-    return newLines.join('\n');
+
+    // Create a truncated version for display in AI block
+    const outputLines = [...newLines];
+    
+    // Remove the command echo line (first line)
+    if (outputLines.length > 0) outputLines.shift();
+    
+    // Trim trailing empty lines and the prompt line at the end
+    while (outputLines.length > 0 && outputLines[outputLines.length - 1].trim() === '') outputLines.pop();
+    if (outputLines.length > 0) {
+      const last = outputLines[outputLines.length - 1];
+      if (last.includes('$') || last.includes('%') || last.includes('#') || /^PS .+>/.test(last.trim())) outputLines.pop();
+    }
+    
+    // Truncate if too long (keep first 50 lines)
+    const MAX_DISPLAY_LINES = 50;
+    if (outputLines.length > MAX_DISPLAY_LINES) {
+      const truncated = outputLines.slice(0, MAX_DISPLAY_LINES);
+      truncated.push(`\n... (${outputLines.length - MAX_DISPLAY_LINES} more lines, truncated for display)`);
+      return truncated.join('\n');
+    }
+    
+    return outputLines.join('\n');
   }
 
   async function executeBlockInline(tab: Tab, blockId: number) {
@@ -1560,7 +2146,7 @@
 
       try {
         await invoke('write_to_shell', { sessionId: tab.sessionId, data: block.commands[i].text + '\r' });
-        const output = await waitForOutput(tab, linesBefore);
+        const output = await waitForOutput(tab, linesBefore, 2000, true);
         block.commands[i].output = output;
 
         const interactivePrompt = extractInteractivePrompt(output);
@@ -2361,6 +2947,27 @@
       }
     }
 
+    // @ mention file picker navigation
+    if (atMenuOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        atMenuIndex = Math.min(atMenuIndex + 1, atFileSuggestions.length - 1);
+        return;
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        atMenuIndex = Math.max(atMenuIndex - 1, 0);
+        return;
+      } else if ((e.key === 'Enter' || e.key === 'Tab') && atFileSuggestions.length > 0) {
+        e.preventDefault();
+        selectAtFile(atFileSuggestions[atMenuIndex]);
+        return;
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeAtMenu();
+        return;
+      }
+    }
+
     if (e.key === 'Tab' && autocompleteSuggestion && !agenticMode) {
       e.preventDefault();
       acceptAutocomplete();
@@ -2697,7 +3304,7 @@
   });
 </script>
 
-<svelte:window onclick={() => { toolsDropdownOpen = false; sshDropdownOpen = false; if (slashMenuOpen) closeSlashMenu(); if (currentView === 'terminal') focusInput(); }} onkeydown={handleGlobalKeydown} />
+<svelte:window onclick={() => { toolsDropdownOpen = false; sshDropdownOpen = false; if (slashMenuOpen) closeSlashMenu(); if (atMenuOpen) closeAtMenu(); if (terminalFileCtxMenu) closeTerminalFileCtxMenu(); if (currentView === 'terminal') focusInput(); }} onkeydown={handleGlobalKeydown} onpaste={handlePaste} />
 
 <div class="app-layout">
   {#if fileExplorerOpen}
@@ -2706,9 +3313,11 @@
       bind:open={fileExplorerOpen}
       bind:showHidden={showHiddenFiles}
       sshTarget={focusedTab()?.sshTarget ?? ''}
+      agentMode={agenticMode}
       onOpenFile={openFile}
       onPreviewFile={previewFile}
       onNavigate={handleExplorerNavigate}
+      onAddToChat={(entry) => addFileToChat(entry)}
       getInitialCwd={getFileExplorerCwd}
     />
   {/if}
@@ -2855,7 +3464,7 @@
                   }
                   focusInput();
                 }} role="presentation">
-                  <div class="terminal-output" bind:this={paneOutputEls[paneLeaf.tabId]} onclick={(e) => handleTerminalFileClick(e, tab)} onmousemove={handleTerminalMouseMove} onmouseleave={handleTerminalMouseLeave}>
+                  <div class="terminal-output" bind:this={paneOutputEls[paneLeaf.tabId]} onclick={(e) => handleTerminalFileClick(e, tab)} oncontextmenu={(e) => handleTerminalFileContextMenu(e, tab)} onmousemove={handleTerminalMouseMove} onmouseleave={handleTerminalMouseLeave}>
                     {#if tab.renderedLines.length === 0 || (tab.renderedLines.length <= tab.emulator.rows && tab.renderedLines.every((r: { text: string; style: CellStyle }[]) => r.length === 0 || (r.length === 1 && r[0].text === '')))}
                       <div class="welcome-block">
                         <div class="welcome-logo">Drover</div>
@@ -2903,6 +3512,30 @@
                             You
                           </div>
                           <div class="ai-thread-question-text">{block.prompt}</div>
+                          {#if block.attachments && block.attachments.length > 0}
+                            <div class="ai-thread-attachments">
+                              {#each block.attachments as attachment}
+                                <button 
+                                  class="ai-thread-attachment-chip" 
+                                  onclick={() => { 
+                                    if (attachment.mimeType.startsWith('image/')) {
+                                      previewUrl = `data:${attachment.mimeType};base64,${attachment.content}`;
+                                      previewFileName = attachment.name;
+                                      rightPane = 'preview';
+                                    }
+                                  }}
+                                  title={attachment.name}
+                                >
+                                  {#if attachment.mimeType.startsWith('image/')}
+                                    <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+                                  {:else}
+                                    <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+                                  {/if}
+                                  <span class="ai-thread-attachment-name">{attachment.name}</span>
+                                </button>
+                              {/each}
+                            </div>
+                          {/if}
                           {#if block.phase === 'done' || block.phase === 'error' || block.phase === 'answered' || block.phase === 'needs_input'}
                             <button class="ai-block-dismiss" onclick={() => removeAiBlock(block.id)} title="Remove">
                               <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
@@ -3008,7 +3641,9 @@
                                   </div>
                                 {/if}
                                 {#if block.commands.length > 0}
-                                  <div class="ai-thread-section-heading">Shell commands</div>
+                                  {#if block.toolCalls.length > 0}
+                                    <div class="ai-thread-section-heading">Shell commands</div>
+                                  {/if}
                                   <div class="ai-block-cmds">
                                     {#each block.commands as cmd, ci}
                                       <div class="ai-cmd-entry">
@@ -3029,8 +3664,10 @@
                                           <code class="ai-cmd-text">
                                             {#if cmd.text.startsWith('[AI] ')}
                                               <span class="ai-cmd-kind ai-cmd-kind-note">Note</span>{cmd.text.substring(5)}
-                                            {:else}
+                                            {:else if block.toolCalls.length > 0}
                                               <span class="ai-cmd-kind ai-cmd-kind-shell">Shell</span>{cmd.text}
+                                            {:else}
+                                              {cmd.text}
                                             {/if}
                                           </code>
                                         </div>
@@ -3123,6 +3760,22 @@
                       {/if}
                     </div>
                     <div class="input-field-wrapper">
+                      {#if agenticMode && aiAttachments.length > 0}
+                        <div class="ai-attachments-bar">
+                          {#each aiAttachments as attachment, i}
+                            <div class="ai-attachment-chip">
+                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="1.5" fill="none"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
+                              <span class="ai-attachment-name" title={attachment.path}>{attachment.name}</span>
+                              <button class="ai-attachment-remove" onclick={() => removeAttachment(i)} title="Remove" aria-label="Remove attachment">
+                                <svg viewBox="0 0 24 24" width="10" height="10" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                              </button>
+                            </div>
+                          {/each}
+                          <button class="ai-attachment-clear" onclick={clearAllAttachments} title="Clear all">
+                            Clear all
+                          </button>
+                        </div>
+                      {/if}
                       {#if slashMenuOpen && savedCommands.length > 0}
                         {@const filtered = getFilteredSlashCommands()}
                         {#if filtered.length > 0}
@@ -3141,6 +3794,35 @@
                             {/each}
                           </div>
                         {/if}
+                      {/if}
+                      {#if atMenuOpen && agenticMode}
+                        <div class="at-menu">
+                          {#if atMenuLoading}
+                            <div class="at-menu-loading">Searching...</div>
+                          {:else if atFileSuggestions.length > 0}
+                            {#each atFileSuggestions as file, i}
+                              <button
+                                class="at-menu-item"
+                                class:active={i === atMenuIndex}
+                                onmouseenter={() => { atMenuIndex = i; }}
+                                onclick={() => selectAtFile(file)}
+                              >
+                                <span class="at-menu-icon">
+                                  {#if file.isDir}
+                                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                                  {:else}
+                                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
+                                  {/if}
+                                </span>
+                                <span class="at-menu-name">{file.name}</span>
+                              </button>
+                            {/each}
+                          {:else if atFilter.length > 0}
+                            <div class="at-menu-empty">No files found matching "{atFilter}"</div>
+                          {:else}
+                            <div class="at-menu-hint">Type to search files...</div>
+                          {/if}
+                        </div>
                       {/if}
                       {#if autocompleteSuggestion && tab.inputValue && !agenticMode}
                         <div class="autocomplete-ghost">{autocompleteSuggestion}</div>
@@ -3168,6 +3850,22 @@
                             if (slashMenuOpen) closeSlashMenu();
                             debouncedSmartComplete(val);
                           }
+                          // @ mention file picker (only in agent mode)
+                          if (agenticMode) {
+                            const atMatch = val.match(/@(\w*)$/);
+                            if (atMatch) {
+                              atFilter = atMatch[1];
+                              atMenuOpen = true;
+                              atMenuIndex = 0;
+                              if (atFilter.length > 0) {
+                                searchFilesForAtMenu(atFilter);
+                              } else {
+                                atFileSuggestions = [];
+                              }
+                            } else {
+                              if (atMenuOpen) closeAtMenu();
+                            }
+                          }
                           autoResizeInput(e.currentTarget as HTMLTextAreaElement);
                         }}
                         placeholder={agenticMode ? 'Describe what you want to do...' : tab.awaitingInput ? 'Interactive prompt active — type response and press Enter' : tab.commandRunning ? 'Command running — input is sent directly to process' : 'Type a command...'}
@@ -3189,8 +3887,43 @@
                             <svg viewBox="0 0 24 24"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path><circle cx="9.5" cy="15.5" r="1"></circle><circle cx="14.5" cy="15.5" r="1"></circle></svg>
                           </button>
                         </div>
+                        {#if agenticMode}
+                          <!-- AI Attachments -->
+                          <button class="toolbar-icon-btn" onclick={handleAttachFile} title="Attach files" aria-label="Attach files">
+                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                            {#if aiAttachments.length > 0}
+                              <span class="toolbar-badge">{aiAttachments.length}</span>
+                            {/if}
+                          </button>
+                          <!-- AI Model Selector -->
+                          <div class="tools-dropdown-wrapper">
+                            <button class="ai-model-selector-btn" class:active={aiModelDropdownOpen} onclick={(e) => { e.stopPropagation(); aiModelDropdownOpen = !aiModelDropdownOpen; toolsDropdownOpen = false; sshDropdownOpen = false; }} title="Select AI model" aria-label="Select AI model">
+                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M12 1v6m0 6v6M5.64 5.64l4.24 4.24m4.24 4.24l4.24 4.24M1 12h6m6 0h6M5.64 18.36l4.24-4.24m4.24-4.24l4.24-4.24"></path></svg>
+                              <span class="ai-model-selector-text">{getSelectedModelName()}</span>
+                              <svg viewBox="0 0 24 24" width="10" height="10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                            </button>
+                            {#if aiModelDropdownOpen}
+                              <div class="ai-model-dropdown">
+                                <div class="ai-model-dropdown-header">Select Model</div>
+                                {#each CLOUDFLARE_AI_MODELS as model}
+                                  <button
+                                    class="ai-model-item"
+                                    class:active={selectedAiModel === model.id}
+                                    onclick={() => selectAiModel(model.id)}
+                                  >
+                                    <div class="ai-model-name">{model.name}</div>
+                                    <div class="ai-model-desc">{model.description}</div>
+                                    {#if selectedAiModel === model.id}
+                                      <svg class="ai-model-check" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                    {/if}
+                                  </button>
+                                {/each}
+                              </div>
+                            {/if}
+                          </div>
+                        {/if}
                         <div class="tools-dropdown-wrapper">
-                          <button class="toolbar-icon-btn" class:active={activeTool !== null} onclick={(e) => { e.stopPropagation(); toolsDropdownOpen = !toolsDropdownOpen; sshDropdownOpen = false; }} title="Tools" aria-label="Tools">
+                          <button class="toolbar-icon-btn" class:active={activeTool !== null} onclick={(e) => { e.stopPropagation(); toolsDropdownOpen = !toolsDropdownOpen; sshDropdownOpen = false; aiModelDropdownOpen = false; }} title="Tools" aria-label="Tools">
                             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
                           </button>
                           {#if toolsDropdownOpen}
@@ -3400,6 +4133,18 @@
               onEdit={openMarkdownInEditor}
             />
           </div>
+        {:else if rightPane === 'diff' && pendingCodeEdit}
+          <div class="split-divider" onmousedown={handleRightPaneResizeStart} role="separator" aria-orientation="vertical"></div>
+          <div class="right-pane" style="width: {rightPaneWidthPct}%; flex: none;" onclick={(e) => e.stopPropagation()}>
+            <DiffViewer
+              fileName={pendingCodeEdit.file_name}
+              diffLines={pendingCodeEdit.diff_lines}
+              summary={pendingCodeEdit.summary}
+              onApply={() => applyCodeEdit()}
+              onReject={() => rejectCodeEdit()}
+              applying={applyingCodeEdit}
+            />
+          </div>
         {/if}
       </div>
     {/if}
@@ -3453,6 +4198,38 @@
             <span class="pane-context-shortcut">{shortcutLabel('W')}</span>
           </button>
         {/if}
+      </div>
+    {/if}
+
+    <!-- Terminal File Context Menu -->
+    {#if terminalFileCtxMenu}
+      <div 
+        class="terminal-file-ctx-menu" 
+        style="left: {terminalFileCtxMenu.x}px; top: {terminalFileCtxMenu.y}px;"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <button class="ctx-menu-item" onclick={addTerminalFileToAgent}>
+          <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none">
+            <path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path>
+          </svg>
+          <span>Add to Agent</span>
+        </button>
+        <button class="ctx-menu-item" onclick={() => { 
+          if (terminalFileCtxMenu) {
+            const { filePath, fileName, tab } = terminalFileCtxMenu;
+            closeTerminalFileCtxMenu();
+            editorSshTarget = tab.sshTarget;
+            rightPane = 'editor';
+            activeTool = null;
+            tick().then(() => editorViewRef?.openFile(filePath, fileName));
+          }
+        }}>
+          <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none">
+            <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+            <polyline points="13 2 13 9 20 9"></polyline>
+          </svg>
+          <span>Open in Editor</span>
+        </button>
       </div>
     {/if}
 

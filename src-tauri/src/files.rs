@@ -382,3 +382,104 @@ pub fn write_remote_file_contents(ssh_target: String, path: String, contents: St
 pub fn write_remote_file_contents(_ssh_target: String, _path: String, _contents: String) -> Result<(), String> {
     Err("SSH remote file writing is not yet supported on Windows".to_string())
 }
+
+#[tauri::command]
+pub async fn select_files_dialog() -> Result<Vec<String>, String> {
+    use rfd::FileDialog;
+    
+    let files = FileDialog::new()
+        .set_title("Select files to attach")
+        .pick_files();
+    
+    match files {
+        Some(paths) => Ok(paths.iter().map(|p: &std::path::PathBuf| p.to_string_lossy().to_string()).collect()),
+        None => Ok(vec![]),
+    }
+}
+
+#[tauri::command]
+pub fn read_file_text(path: String) -> Result<String, String> {
+    let file_path = expand_home(&path);
+    std::fs::read_to_string(&file_path)
+        .map_err(|e| format!("Failed to read file: {}", e))
+}
+
+#[derive(Serialize)]
+pub struct SearchResult {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+#[tauri::command]
+pub fn search_files(directory: String, pattern: String, max_results: Option<usize>) -> Result<Vec<SearchResult>, String> {
+    use std::path::Path;
+    
+    let dir_path = expand_home(&directory);
+    let max = max_results.unwrap_or(10);
+    let pattern_lower = pattern.to_lowercase();
+    
+    let mut results = Vec::new();
+    
+    // Recursive search function
+    fn search_dir(
+        dir: &Path,
+        pattern: &str,
+        results: &mut Vec<SearchResult>,
+        max: usize,
+        depth: usize,
+    ) {
+        if depth > 5 || results.len() >= max {
+            return;
+        }
+        
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        
+        for entry in entries.flatten() {
+            if results.len() >= max {
+                break;
+            }
+            
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            
+            // Skip hidden files/dirs
+            if name.starts_with('.') {
+                continue;
+            }
+            
+            let is_dir = path.is_dir();
+            let name_lower = name.to_lowercase();
+            
+            // Check if name contains the pattern
+            if name_lower.contains(pattern) {
+                results.push(SearchResult {
+                    name: name.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    is_dir,
+                });
+            }
+            
+            // Recurse into directories
+            if is_dir {
+                search_dir(&path, pattern, results, max, depth + 1);
+            }
+        }
+    }
+    
+    search_dir(Path::new(&dir_path), &pattern_lower, &mut results, max, 0);
+    
+    // Sort: files first, then by name
+    results.sort_by(|a, b| {
+        match (a.is_dir, b.is_dir) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+    
+    Ok(results)
+}

@@ -9,18 +9,22 @@
     open = $bindable(false),
     showHidden = $bindable(false),
     sshTarget = '',
+    agentMode = false,
     onOpenFile,
     onPreviewFile,
     onNavigate,
+    onAddToChat,
     getInitialCwd,
   }: {
     root: string;
     open: boolean;
     showHidden: boolean;
     sshTarget: string;
+    agentMode?: boolean;
     onOpenFile: (entry: FileEntry) => void;
     onPreviewFile: (entry: FileEntry) => void;
     onNavigate: (path: string) => void;
+    onAddToChat?: (entry: FileEntry) => void;
     getInitialCwd: () => Promise<string | null>;
   } = $props();
 
@@ -482,6 +486,12 @@
         <button class="pane-context-item" onclick={() => { if (ctxMenu?.entry) onPreviewFile(ctxMenu.entry); closeContextMenu(); }} role="menuitem">
           <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
           Preview
+        </button>
+      {/if}
+      {#if agentMode && !ctxMenu.entry.is_dir && onAddToChat}
+        <button class="pane-context-item" onclick={() => { if (ctxMenu?.entry && onAddToChat) { onAddToChat(ctxMenu.entry); closeContextMenu(); } }} role="menuitem">
+          <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path><line x1="12" y1="8" x2="12" y2="12"></line><line x1="10" y1="10" x2="14" y2="10"></line></svg>
+          Add to Chat
         </button>
       {/if}
       <div class="pane-context-separator"></div>
