@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { flushSync } from 'svelte';
   import { THEMES, applyThemeCssVars, type TerminalTheme } from '$lib/theme';
 
   interface SshSession { id: string; nickname: string; command: string; }
@@ -8,6 +9,7 @@
   let {
     aiAccountId = $bindable(''),
     aiApiToken = $bindable(''),
+    geminiApiKey = $bindable(''),
     activeThemeId = $bindable('dracula'),
     customTheme = $bindable<TerminalTheme>({ ...THEMES.custom }),
     sshSessions = [],
@@ -15,6 +17,8 @@
     mcpServers = [],
     onSaveSettings,
     onRevokeCredentials,
+    onSaveGeminiKey,
+    onRevokeGeminiKey,
     onSaveTheme,
     onAddSshSession,
     onRemoveSshSession,
@@ -25,6 +29,7 @@
   }: {
     aiAccountId: string;
     aiApiToken: string;
+    geminiApiKey: string;
     activeThemeId: string;
     customTheme: TerminalTheme;
     sshSessions: SshSession[];
@@ -32,6 +37,8 @@
     mcpServers: McpServerEntry[];
     onSaveSettings: (baseUrl: string, apiToken: string) => Promise<void>;
     onRevokeCredentials: () => Promise<void>;
+    onSaveGeminiKey: (apiKey: string) => Promise<void>;
+    onRevokeGeminiKey: () => Promise<void>;
     onSaveTheme: () => Promise<void>;
     onAddSshSession: (nickname: string, command: string) => void;
     onRemoveSshSession: (id: string) => void;
@@ -54,13 +61,17 @@
   let showMcpAuthToken = $state(false);
   let settingsAccountId = $state(aiAccountId);
   let settingsApiToken = $state(aiApiToken);
+  let settingsGeminiKey = $state(geminiApiKey);
   let showToken = $state(false);
+  let showGeminiToken = $state(false);
   let settingsSaved = $state(false);
+  let geminiSaved = $state(false);
 
   // Sync when props change
   $effect(() => {
     settingsAccountId = aiAccountId;
     settingsApiToken = aiApiToken;
+    settingsGeminiKey = geminiApiKey;
   });
 
   async function handleSave() {
@@ -76,6 +87,18 @@
     showToken = false;
   }
 
+  async function handleSaveGemini() {
+    await onSaveGeminiKey(settingsGeminiKey.trim());
+    geminiSaved = true;
+    setTimeout(() => { geminiSaved = false; }, 2000);
+  }
+
+  async function handleRevokeGemini() {
+    await onRevokeGeminiKey();
+    settingsGeminiKey = '';
+    showGeminiToken = false;
+  }
+
   function selectTheme(id: string) {
     activeThemeId = id;
     applyThemeCssVars(activeThemeId === 'custom' ? customTheme : THEMES[activeThemeId] || THEMES.dracula);
@@ -86,6 +109,16 @@
     applyThemeCssVars(customTheme);
     onSaveTheme();
   }
+
+  function transition(fn: () => void) {
+    if (document.startViewTransition) {
+      document.startViewTransition(() => {
+        flushSync(fn);
+      });
+    } else {
+      fn();
+    }
+  }
 </script>
 
 <div class="settings-layout">
@@ -93,7 +126,7 @@
     <button
       class="settings-nav-item"
       class:active={settingsTab === 'ai'}
-      onclick={() => { settingsTab = 'ai'; }}
+      onclick={() => { transition(() => { settingsTab = 'ai'; }); }}
     >
       <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path><circle cx="9.5" cy="15.5" r="1"></circle><circle cx="14.5" cy="15.5" r="1"></circle></svg>
       <span>AI</span>
@@ -101,7 +134,7 @@
     <button
       class="settings-nav-item"
       class:active={settingsTab === 'theme'}
-      onclick={() => { settingsTab = 'theme'; }}
+      onclick={() => { transition(() => { settingsTab = 'theme'; }); }}
     >
       <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
       <span>Theme</span>
@@ -109,7 +142,7 @@
     <button
       class="settings-nav-item"
       class:active={settingsTab === 'ssh'}
-      onclick={() => { settingsTab = 'ssh'; }}
+      onclick={() => { transition(() => { settingsTab = 'ssh'; }); }}
     >
       <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"></rect><path d="M7 8l4 4-4 4"></path><line x1="13" y1="16" x2="17" y2="16"></line></svg>
       <span>SSH</span>
@@ -117,7 +150,7 @@
     <button
       class="settings-nav-item"
       class:active={settingsTab === 'commands'}
-      onclick={() => { settingsTab = 'commands'; }}
+      onclick={() => { transition(() => { settingsTab = 'commands'; }); }}
     >
       <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
       <span>Commands</span>
@@ -125,7 +158,7 @@
     <button
       class="settings-nav-item"
       class:active={settingsTab === 'mcp'}
-      onclick={() => { settingsTab = 'mcp'; }}
+      onclick={() => { transition(() => { settingsTab = 'mcp'; }); }}
     >
       <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a4 4 0 0 1 4 4v2h2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-2v2a4 4 0 0 1-8 0v-2H6a2 2 0 0 1-2-2v-2a2 2 0 0 1 2-2h2V6a4 4 0 0 1 4-4z"></path></svg>
       <span>MCP</span>
@@ -133,7 +166,7 @@
     <button
       class="settings-nav-item"
       class:active={settingsTab === 'about'}
-      onclick={() => { settingsTab = 'about'; }}
+      onclick={() => { transition(() => { settingsTab = 'about'; }); }}
     >
       <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
       <span>About</span>
@@ -196,6 +229,52 @@
           {#if aiAccountId || aiApiToken}
             <button class="settings-btn-revoke" onclick={handleRevoke}>
               Clear Configuration
+            </button>
+          {/if}
+        </div>
+      </section>
+
+      <section class="settings-section" style="margin-top: 24px;">
+        <h2 class="settings-section-title">Google Gemini</h2>
+        <p class="settings-section-desc">Use Google's Gemini models directly via API. Get a key from <a href="https://aistudio.google.com/apikey" target="_blank" style="color: var(--accent-primary); text-decoration: none;">Google AI Studio</a>.</p>
+
+        <div class="settings-field">
+          <label class="settings-label" for="gemini-api-key">API Key</label>
+          <div class="settings-input-group">
+            <input
+              id="gemini-api-key"
+              class="settings-input"
+              type={showGeminiToken ? 'text' : 'password'}
+              bind:value={settingsGeminiKey}
+              placeholder="AIza..."
+              spellcheck="false"
+            />
+            <button class="settings-reveal-btn" onclick={() => { showGeminiToken = !showGeminiToken; }} title={showGeminiToken ? 'Hide key' : 'Show key'}>
+              {showGeminiToken ? 'Hide' : 'Show'}
+            </button>
+          </div>
+          <span class="settings-hint">Your Google Gemini API key for direct model access</span>
+        </div>
+
+        {#if geminiApiKey}
+          <div class="settings-status settings-status-active">
+            <span class="settings-status-dot active"></span>
+            <span>Gemini API configured</span>
+          </div>
+        {:else}
+          <div class="settings-status settings-status-inactive">
+            <span class="settings-status-dot"></span>
+            <span>No Gemini key — Gemini models disabled in model selector</span>
+          </div>
+        {/if}
+
+        <div class="settings-actions">
+          <button class="settings-btn-save" onclick={handleSaveGemini} disabled={!settingsGeminiKey.trim()}>
+            {geminiSaved ? 'Saved' : 'Save Key'}
+          </button>
+          {#if geminiApiKey}
+            <button class="settings-btn-revoke" onclick={handleRevokeGemini}>
+              Clear Key
             </button>
           {/if}
         </div>

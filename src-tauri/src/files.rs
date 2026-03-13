@@ -413,73 +413,72 @@ pub struct SearchResult {
 
 #[tauri::command]
 pub fn search_files(directory: String, pattern: String, max_results: Option<usize>) -> Result<Vec<SearchResult>, String> {
-    use std::path::Path;
-    
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+
+    const SKIP_DIRS: &[&str] = &[
+        "node_modules", "dist", "build", "target", ".git", ".svelte-kit",
+        "__pycache__", ".next", ".nuxt", "vendor", ".cargo", "out",
+    ];
+
     let dir_path = expand_home(&directory);
-    let max = max_results.unwrap_or(10);
+    let max = max_results.unwrap_or(20);
     let pattern_lower = pattern.to_lowercase();
-    
-    let mut results = Vec::new();
-    
-    // Recursive search function
-    fn search_dir(
-        dir: &Path,
-        pattern: &str,
-        results: &mut Vec<SearchResult>,
-        max: usize,
-        depth: usize,
-    ) {
-        if depth > 5 || results.len() >= max {
-            return;
+    let max_depth: usize = 5;
+
+    // BFS: collect all matches level by level so shallow results come first
+    let mut results: Vec<(usize, SearchResult)> = Vec::new();
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((PathBuf::from(&dir_path), 0));
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > max_depth {
+            continue;
         }
-        
-        let entries = match std::fs::read_dir(dir) {
+
+        let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => continue,
         };
-        
+
         for entry in entries.flatten() {
-            if results.len() >= max {
-                break;
-            }
-            
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             // Skip hidden files/dirs
             if name.starts_with('.') {
                 continue;
             }
-            
+
             let is_dir = path.is_dir();
             let name_lower = name.to_lowercase();
-            
+
             // Check if name contains the pattern
-            if name_lower.contains(pattern) {
-                results.push(SearchResult {
+            if name_lower.contains(&pattern_lower) {
+                results.push((depth, SearchResult {
                     name: name.clone(),
                     path: path.to_string_lossy().to_string(),
                     is_dir,
-                });
+                }));
             }
-            
-            // Recurse into directories
-            if is_dir {
-                search_dir(&path, pattern, results, max, depth + 1);
+
+            // Queue subdirectories, but skip heavy/irrelevant ones
+            if is_dir && !SKIP_DIRS.contains(&name.as_str()) {
+                queue.push_back((path, depth + 1));
             }
         }
     }
-    
-    search_dir(Path::new(&dir_path), &pattern_lower, &mut results, max, 0);
-    
-    // Sort: files first, then by name
+
+    // Sort by depth (shallow first), then files before dirs, then by name
     results.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (false, true) => std::cmp::Ordering::Less,
-            (true, false) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+        a.0.cmp(&b.0)
+            .then(match (a.1.is_dir, b.1.is_dir) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+            .then(a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
     });
-    
-    Ok(results)
+
+    Ok(results.into_iter().take(max).map(|(_, r)| r).collect())
 }

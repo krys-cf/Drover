@@ -173,32 +173,6 @@ html, body {
   user-select: none;
 }
 
-.titlebar-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  padding-right: 2px;
-}
-
-.titlebar-brand-mark {
-  width: 14px;
-  height: 14px;
-  border-radius: 4px;
-  background: radial-gradient(circle at 30% 30%, rgba(136, 170, 255, 0.95), rgba(76, 104, 255, 0.85) 48%, rgba(40, 52, 120, 0.9) 100%);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
-  flex: 0 0 auto;
-}
-
-.titlebar-brand-text {
-  color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 500;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-  opacity: 0.95;
-}
-
 .titlebar-settings-nav {
   display: flex;
   align-items: center;
@@ -445,6 +419,57 @@ html, body {
   width: 2px;
   border-radius: 2px;
   background: linear-gradient(180deg, rgba(120, 150, 255, 0.4), rgba(79, 208, 147, 0.4));
+}
+
+/* Passthrough (inline shell command) blocks */
+.ai-thread-passthrough {
+  margin: 6px 0;
+  gap: 0;
+}
+.ai-thread-passthrough::before {
+  background: rgba(255, 255, 255, 0.12);
+}
+.ai-passthrough-block {
+  margin-left: 16px;
+}
+.ai-passthrough-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  color: rgba(255, 255, 255, 0.7);
+}
+.ai-passthrough-cmd svg {
+  flex-shrink: 0;
+  opacity: 0.5;
+}
+.ai-passthrough-cmd code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+  flex: 1;
+}
+.ai-passthrough-cmd .ai-block-dismiss {
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.ai-thread-passthrough:hover .ai-passthrough-cmd .ai-block-dismiss {
+  opacity: 0.5;
+}
+.ai-passthrough-output {
+  margin: 0 0 0 0;
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #b8bccd;
+  background: rgba(6, 10, 18, 0.6);
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
 }
 
 .ai-thread-question,
@@ -1144,6 +1169,44 @@ html, body {
   color: #8be9fd;
 }
 
+.toolbar-text-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  height: 24px;
+  padding: 0 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: all var(--transition-fast);
+}
+
+.toolbar-text-btn svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.toolbar-text-btn:hover {
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+}
+
+.toolbar-text-btn.active {
+  color: var(--text-accent);
+  background: var(--bg-elevated);
+}
+
 .toolbar-path-btn {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1236,12 +1299,16 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
+  width: auto;
+  padding: 0 10px;
+  gap: 6px;
   height: 100%;
-  padding: 0;
   border: none;
   background: transparent;
   color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
   cursor: pointer;
   transition: all var(--transition-fast);
   position: relative;
@@ -1268,7 +1335,7 @@ html, body {
 
 .mode-switch-btn.active {
   background: var(--bg-elevated);
-  color: var(--text-primary);
+  color: var(--text-accent);
 }
 
 /* Sidebar toggle — pill group (sessions + explorer) */
@@ -1377,6 +1444,7 @@ html, body {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  view-transition-name: main-view;
 }
 
 .pane-container {
@@ -1720,6 +1788,35 @@ html, body {
   flex: 1;
   overflow: hidden;
   display: flex;
+  view-transition-name: main-view;
+}
+
+/* ============================================
+   View Transitions
+   ============================================ */
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.2s;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+::view-transition-old(main-view) {
+  animation: 150ms cubic-bezier(0.4, 0, 1, 1) both fade-out;
+}
+
+::view-transition-new(main-view) {
+  animation: 200ms cubic-bezier(0, 0, 0.2, 1) 50ms both fade-in;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-out {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(-4px); }
 }
 
 /* ============================================
@@ -2404,6 +2501,14 @@ html, body {
   color: #8be9fd;
 }
 
+.ai-model-item.disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.ai-model-item.disabled:hover {
+  background: transparent;
+}
+
 .ai-model-name {
   font-size: 12px;
   font-weight: 600;
@@ -2602,6 +2707,7 @@ html, body {
   flex: 1;
   overflow-y: auto;
   padding: var(--space-xl) var(--space-2xl);
+  view-transition-name: settings-panel;
 }
 
 .settings-content {
@@ -3612,10 +3718,24 @@ html, body {
 }
 
 .at-menu-name {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.at-menu-path {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: #5a5a70;
+  font-size: 11px;
+  direction: rtl;
+  text-align: left;
+}
+
+.at-menu-item.active .at-menu-path,
+.at-menu-item:hover .at-menu-path {
+  color: #7a7a94;
 }
 
 .at-menu-loading,
