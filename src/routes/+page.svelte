@@ -1188,8 +1188,10 @@
   function syncAiBlockFromLiveState(state: LiveIdeState) {
     const blockId = liveAgentActiveBlockId;
     if (!blockId) return;
+    const existingBlock = aiBlocks.find((block) => block.id === blockId);
+    const previousPhase = existingBlock?.phase ?? null;
     updateAiBlock(blockId, {
-      prompt: state.prompt || aiBlocks.find((block) => block.id === blockId)?.prompt || '',
+      prompt: state.prompt || existingBlock?.prompt || '',
       phase: mapLivePhase(state.phase),
       commands: state.commands || [],
       raw: state.raw || '',
@@ -1197,7 +1199,8 @@
       error: state.error || '',
     });
     if (state.sessionId) currentAiSessionId = state.sessionId;
-    if (state.phase === 'approval' && aiExecMode === 'auto') {
+    if (state.phase === 'approval' && aiExecMode === 'auto' && previousPhase !== 'commands') {
+      pendingCommand = state.commands?.[0]?.text || '';
       activeBlockId = blockId;
       void executePendingCommand();
     }
@@ -2530,16 +2533,14 @@
 
   async function executePendingCommand() {
     const tab = focusedTab();
-    if (!tab || !pendingCommand || !tab.connected) return;
+    const block = aiBlocks.find(b => b.id === activeBlockId);
+    if (!tab || !tab.connected || !block || block.commands.length === 0) return;
     pendingCommand = '';
     updateAiBlock(activeBlockId, { phase: 'executing' });
     if (liveAgentClient && currentAiSessionId) {
-      const block = aiBlocks.find(b => b.id === activeBlockId);
-      if (block) {
-        void liveAgentClient.call('markExecuting', [block.commands]).catch((error) => {
-          console.error('Failed to mark live execution state:', error);
-        });
-      }
+      void liveAgentClient.call('markExecuting', [block.commands]).catch((error) => {
+        console.error('Failed to mark live execution state:', error);
+      });
     }
     await executeBlockInline(tab, activeBlockId);
   }
