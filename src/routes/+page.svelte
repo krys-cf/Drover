@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, flushSync } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { load } from '@tauri-apps/plugin-store';
@@ -230,6 +230,16 @@
   let aiExecMode = $state<'auto' | 'manual' | null>(null);
   let aiExecPromptShown = $state(false);
   let currentView = $state<'terminal' | 'settings'>('terminal');
+
+  function transition(fn: () => void) {
+    if (document.startViewTransition) {
+      document.startViewTransition(() => {
+        flushSync(fn);
+      });
+    } else {
+      fn();
+    }
+  }
   
   // AI attachments and model selection
   interface AiAttachment {
@@ -321,17 +331,31 @@
   let pendingCodeEdit = $state<CodeEditResult | null>(null);
   let applyingCodeEdit = $state(false);
   
-  const CLOUDFLARE_AI_MODELS = [
-    { id: '@cf/meta/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout (17B)', description: 'Fast, efficient model' },
-    { id: '@cf/meta/llama-3.1-8b-instruct', name: 'Llama 3.1 (8B)', description: 'Balanced performance' },
-    { id: '@cf/meta/llama-3.1-70b-instruct', name: 'Llama 3.1 (70B)', description: 'High quality responses' },
-    { id: '@cf/meta/llama-3.2-3b-instruct', name: 'Llama 3.2 (3B)', description: 'Lightweight and fast' },
-    { id: '@cf/meta/llama-3.2-11b-vision-instruct', name: 'Llama 3.2 Vision (11B)', description: 'Vision + text understanding' },
-    { id: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', name: 'Llama 3.3 (70B) Fast', description: 'Optimized for speed' },
-    { id: '@cf/qwen/qwen2.5-14b-instruct', name: 'Qwen 2.5 (14B)', description: 'Strong reasoning' },
-    { id: '@cf/qwen/qwen2.5-72b-instruct', name: 'Qwen 2.5 (72B)', description: 'Advanced reasoning' },
-    { id: '@cf/deepseek-ai/deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 (70B)', description: 'Reasoning specialist' },
+  type AiModelEntry = { id: string; name: string; description: string; provider: 'cloudflare' | 'gemini' };
+  const AI_MODELS: AiModelEntry[] = [
+    // Cloudflare (via Kuratchi)
+    { id: '@cf/meta/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout (17B)', description: 'Fast, efficient model', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.1-8b-instruct', name: 'Llama 3.1 (8B)', description: 'Balanced performance', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.1-70b-instruct', name: 'Llama 3.1 (70B)', description: 'High quality responses', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.2-3b-instruct', name: 'Llama 3.2 (3B)', description: 'Lightweight and fast', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.2-11b-vision-instruct', name: 'Llama 3.2 Vision (11B)', description: 'Vision + text understanding', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', name: 'Llama 3.3 (70B) Fast', description: 'Optimized for speed', provider: 'cloudflare' },
+    { id: '@cf/qwen/qwen2.5-14b-instruct', name: 'Qwen 2.5 (14B)', description: 'Strong reasoning', provider: 'cloudflare' },
+    { id: '@cf/qwen/qwen2.5-72b-instruct', name: 'Qwen 2.5 (72B)', description: 'Advanced reasoning', provider: 'cloudflare' },
+    { id: '@cf/deepseek-ai/deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 (70B)', description: 'Reasoning specialist', provider: 'cloudflare' },
+    // Google Gemini (direct API)
+    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', description: 'Fast + thinking', provider: 'gemini' },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', description: 'Most capable', provider: 'gemini' },
+    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', description: 'Speed optimized', provider: 'gemini' },
+    { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite', description: 'Lightweight', provider: 'gemini' },
   ];
+
+  function getSelectedModelProvider(): 'cloudflare' | 'gemini' {
+    return AI_MODELS.find(m => m.id === selectedAiModel)?.provider || 'cloudflare';
+  }
+
+  // Keep backward compat alias
+  const CLOUDFLARE_AI_MODELS = AI_MODELS.filter(m => m.provider === 'cloudflare');
 
   const ERROR_PATTERNS = [
     /is not recognized as the name of a cmdlet/i,
@@ -523,6 +547,7 @@
 
   let aiAccountId = $state('');
   let aiApiToken = $state('');
+  let geminiApiKey = $state('');
 
   async function getStrongholdStore() {
     const vaultPath = `${await appDataDir()}/vault.hold`;
@@ -613,6 +638,11 @@
     } catch (e) {
       console.error('Failed to load stronghold token:', e);
     }
+    try {
+      geminiApiKey = await strongholdGet('gemini_api_key');
+    } catch (e) {
+      console.error('Failed to load Gemini API key:', e);
+    }
     if (aiAccountId && aiApiToken) {
       await refreshAiSessions();
     }
@@ -690,6 +720,15 @@
     slashMenuOpen = false;
     slashFilter = '';
     slashMenuIndex = 0;
+  }
+
+  function relativeFilePath(fullPath: string): string {
+    const tab = focusedTab();
+    if (!tab?.cwd) return fullPath.replace(/\\/g, '/');
+    const cwd = tab.cwd.replace(/\\/g, '/').replace(/\/$/, '');
+    const norm = fullPath.replace(/\\/g, '/');
+    if (norm.startsWith(cwd + '/')) return norm.slice(cwd.length + 1);
+    return norm;
   }
 
   function closeAtMenu() {
@@ -1300,12 +1339,50 @@
     }
   }
 
+  async function saveGeminiKey(apiKey: string) {
+    try {
+      await strongholdInsert('gemini_api_key', apiKey);
+      geminiApiKey = apiKey;
+    } catch (e) {
+      console.error('Failed to save Gemini key:', e);
+    }
+  }
+
+  async function revokeGeminiKey() {
+    try {
+      await strongholdRemove('gemini_api_key');
+      geminiApiKey = '';
+      // If currently using a Gemini model, switch back to default
+      if (getSelectedModelProvider() === 'gemini') {
+        selectedAiModel = '@cf/meta/llama-4-scout-17b-16e-instruct';
+      }
+    } catch (e) {
+      console.error('Failed to revoke Gemini key:', e);
+    }
+  }
+
   function openSettings() {
-    currentView = 'settings';
+    if (document.startViewTransition) {
+      document.startViewTransition(() => {
+        flushSync(() => {
+          currentView = 'settings';
+        });
+      });
+    } else {
+      currentView = 'settings';
+    }
   }
 
   function closeSettings() {
-    currentView = 'terminal';
+    if (document.startViewTransition) {
+      document.startViewTransition(() => {
+        flushSync(() => {
+          currentView = 'terminal';
+        });
+      });
+    } else {
+      currentView = 'terminal';
+    }
     tick().then(() => focusInput());
   }
 
@@ -1613,20 +1690,24 @@
   
 
   function closePreview() {
-    rightPane = null;
-    previewUrl = '';
-    previewFileName = '';
-    previewSshTarget = '';
-    previewLoading = false;
+    transition(() => {
+      rightPane = null;
+      previewUrl = '';
+      previewFileName = '';
+      previewSshTarget = '';
+      previewLoading = false;
+    });
     tick().then(() => focusInput());
   }
 
   async function openImagePreview(fullPath: string, fileName: string, sshTarget: string) {
-    previewFileName = fileName;
-    previewSshTarget = sshTarget;
-    previewLoading = true;
-    rightPane = 'preview';
-    activeTool = null;
+    transition(() => {
+      previewFileName = fileName;
+      previewSshTarget = sshTarget;
+      previewLoading = true;
+      rightPane = 'preview';
+      activeTool = null;
+    });
     try {
       if (sshTarget) {
         // Read remote image as base64
@@ -1790,7 +1871,7 @@
     tabId: string;
     prompt: string;
     attachments: AiBlockAttachment[];  // Store images/files with the prompt
-    phase: 'choosing' | 'thinking' | 'commands' | 'executing' | 'retrying' | 'needs_input' | 'done' | 'error' | 'answered';
+    phase: 'choosing' | 'thinking' | 'commands' | 'executing' | 'retrying' | 'needs_input' | 'done' | 'error' | 'answered' | 'passthrough';
     commands: AiCmdEntry[];
     toolCalls: AiToolCallEntry[];
     error: string;
@@ -1811,7 +1892,7 @@
   }
 
   function getActiveAiBlock(tabId: string): AiBlock | null {
-    return aiBlocks.findLast(b => b.tabId === tabId && b.phase !== 'done' && b.phase !== 'error' && b.phase !== 'answered') ?? null;
+    return aiBlocks.findLast(b => b.tabId === tabId && b.phase !== 'done' && b.phase !== 'error' && b.phase !== 'answered' && b.phase !== 'passthrough') ?? null;
   }
   function createAiBlock(tabId: string, data: Partial<AiBlock>): AiBlock {
     const block: AiBlock = { 
@@ -1918,7 +1999,7 @@
   }
 
   function getSelectedModelName(): string {
-    return CLOUDFLARE_AI_MODELS.find(m => m.id === selectedAiModel)?.name || 'Llama 4 Scout';
+    return AI_MODELS.find(m => m.id === selectedAiModel)?.name || 'Llama 4 Scout';
   }
 
   async function handlePaste(e: ClipboardEvent) {
@@ -1978,15 +2059,30 @@
 
     const input = tab.inputValue.trim();
 
-    // Passthrough: basic shell commands run directly
+    // Passthrough: basic shell commands run inline in the conversation
     if (isBasicShellCommand(input)) {
       tab.inputValue = '';
       resetInputHeight(tab.id);
+      const block = createAiBlock(tab.id, {
+        prompt: input,
+        phase: 'passthrough',
+        commands: [{ text: input, status: 'running', output: '' }],
+      });
+      activeBlockId = block.id;
+      scrollToBottom();
+
+      const linesBefore = getPlainLines(tab).length;
       try {
         await invoke('write_to_shell', { sessionId: tab.sessionId, data: input + '\r' });
+        const output = await waitForOutput(tab, linesBefore, 3000, true);
+        block.commands[0].output = output;
+        block.commands[0].status = 'done';
       } catch (e) {
+        block.commands[0].output = String(e);
+        block.commands[0].status = 'error';
         console.error('Failed to execute passthrough command:', e);
       }
+      updateAiBlock(block.id, { commands: [...block.commands] });
       await tick();
       scrollToBottom();
       setTimeout(() => updateTabState(tab), 500);
@@ -2031,19 +2127,30 @@
     const filePathMatches = input.match(filePathRegex);
     const detectedFilePath = filePathMatches ? filePathMatches[0].trim().replace(/[,;:]$/, '') : null;
     
+    const provider = getSelectedModelProvider();
+
     // If modification request with text file attachment, use code edit flow
     if (isModificationRequest && textFileAttachment) {
       try {
         console.log('[AI] Code edit request detected for:', textFileAttachment.name);
-        const editResult: CodeEditResult = await invoke('ai_edit_code', {
-          baseUrl: aiAccountId,
-          apiToken: aiApiToken,
-          model: selectedAiModel,
-          fileName: textFileAttachment.name,
-          filePath: textFileAttachment.path || null,
-          fileContent: textFileAttachment.content,
-          instruction: input,
-        });
+        const editResult: CodeEditResult = provider === 'gemini'
+          ? await invoke('ai_gemini_edit_code', {
+              apiKey: geminiApiKey,
+              model: selectedAiModel,
+              fileName: textFileAttachment.name,
+              filePath: textFileAttachment.path || null,
+              fileContent: textFileAttachment.content,
+              instruction: input,
+            })
+          : await invoke('ai_edit_code', {
+              baseUrl: aiAccountId,
+              apiToken: aiApiToken,
+              model: selectedAiModel,
+              fileName: textFileAttachment.name,
+              filePath: textFileAttachment.path || null,
+              fileContent: textFileAttachment.content,
+              instruction: input,
+            });
         
         // Store the pending edit and show in diff viewer
         pendingCodeEdit = editResult;
@@ -2071,14 +2178,12 @@
     if (isModificationRequest && detectedFilePath && !textFileAttachment) {
       try {
         console.log('[AI] Code edit from path detected:', detectedFilePath);
-        const editResult: CodeEditResult = await invoke('ai_edit_code_from_path', {
-          baseUrl: aiAccountId,
-          apiToken: aiApiToken,
-          model: selectedAiModel,
-          filePath: detectedFilePath,
-          instruction: input,
-          cwd: tab.cwd || null,
-        });
+        const editResult: CodeEditResult = await invoke(
+          provider === 'gemini' ? 'ai_gemini_edit_code_from_path' : 'ai_edit_code_from_path',
+          provider === 'gemini'
+            ? { apiKey: geminiApiKey, model: selectedAiModel, filePath: detectedFilePath, instruction: input, cwd: tab.cwd || null }
+            : { baseUrl: aiAccountId, apiToken: aiApiToken, model: selectedAiModel, filePath: detectedFilePath, instruction: input, cwd: tab.cwd || null }
+        );
         
         // Store the pending edit and show in diff viewer
         pendingCodeEdit = editResult;
@@ -2101,42 +2206,57 @@
       }
     }
 
-    try {
-      const client = await ensureLiveAgentConnection();
-      liveAgentActiveBlockId = block.id;
-      await client.call('submitPrompt', [input, buildLivePromptOptions(tab)]);
-      aiAttachments = [];
-      aiLoading = false;
-      pendingCommand = '';
-      return;
-    } catch (e) {
-      console.error('Live agent submit failed, falling back to REST path:', e);
+    // Live agent only works with Kuratchi (Cloudflare)
+    if (provider === 'cloudflare') {
+      try {
+        const client = await ensureLiveAgentConnection();
+        liveAgentActiveBlockId = block.id;
+        await client.call('submitPrompt', [input, buildLivePromptOptions(tab)]);
+        aiAttachments = [];
+        aiLoading = false;
+        pendingCommand = '';
+        return;
+      } catch (e) {
+        console.error('Live agent submit failed, falling back to REST path:', e);
+      }
     }
 
     // Step 1: Get commands/tool calls from AI (MCP-aware)
-    const aiParams = {
-      baseUrl: aiAccountId,
-      apiToken: aiApiToken,
-      model: selectedAiModel,
-      sessionId: currentAiSessionId || null,
-      prompt: input,
-      attachments: aiAttachments.map(a => ({
-        name: a.name,
-        content: a.content,
-        mimeType: a.mimeType,
-      })),
-      cwd: tab.cwd || null,
-      osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
-      shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
-      sshTarget: tab.sshTarget || null,
-    };
-    let turn: AiChatTurn;
-    console.log('[AI] Sending request with attachments:', aiParams.attachments.length, aiParams.attachments.map(a => ({ name: a.name, mimeType: a.mimeType, contentLen: a.content?.length })));
+    let rawResponse: string;
+    const attachmentPayload = aiAttachments.map(a => ({
+      name: a.name,
+      content: a.content,
+      mimeType: a.mimeType,
+    }));
     try {
-      turn = await invoke('ai_chat_with_tools', aiParams);
-      if (turn.session_id) currentAiSessionId = turn.session_id;
-      await refreshAiSessions();
-      // Clear attachments after successful request
+      if (provider === 'gemini') {
+        rawResponse = await invoke('ai_gemini_chat', {
+          apiKey: geminiApiKey,
+          model: selectedAiModel,
+          prompt: input,
+          attachments: attachmentPayload,
+          cwd: tab.cwd || null,
+          osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
+          shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
+          sshTarget: tab.sshTarget || null,
+        });
+      } else {
+        const turn: AiChatTurn = await invoke('ai_chat_with_tools', {
+          baseUrl: aiAccountId,
+          apiToken: aiApiToken,
+          model: selectedAiModel,
+          sessionId: currentAiSessionId || null,
+          prompt: input,
+          attachments: attachmentPayload,
+          cwd: tab.cwd || null,
+          osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
+          shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
+          sshTarget: tab.sshTarget || null,
+        });
+        if (turn.session_id) currentAiSessionId = turn.session_id;
+        await refreshAiSessions();
+        rawResponse = turn.response;
+      }
       aiAttachments = [];
     } catch (e) {
       updateAiBlock(block.id, { phase: 'error', error: `AI request failed: ${e}` });
@@ -2146,8 +2266,8 @@
     }
 
     // Step 2: Parse response — separate TOOL_CALL lines from shell commands
-    console.log('[ai_chat_with_tools] raw response:', turn.response);
-    const rawText = turn.response.trim();
+    console.log('[AI] raw response:', rawResponse);
+    const rawText = rawResponse.trim();
     
     // Handle direct answers (e.g., from vision model image analysis)
     if (rawText.startsWith('ANSWER:')) {
@@ -2777,7 +2897,7 @@
       const sessionId: string = await invoke('spawn_shell', { rows, cols });
       const emu = new TerminalEmulator(rows, cols);
       const newTab = new Tab(tabId, sessionId, emu);
-      newTab.title = '~';
+      newTab.title = 'Drover';
       wireEmulator(newTab);
       tabs = [...tabs, newTab];
       activeTabId = tabId;
@@ -2850,7 +2970,7 @@
       const tabId = `tab-${tabCounter}`;
       const emu = new TerminalEmulator(rows, cols);
       const newTab = new Tab(tabId, sessionId, emu);
-      newTab.title = '~';
+      newTab.title = 'Drover';
       wireEmulator(newTab);
       tabs = [...tabs, newTab];
       
@@ -3095,20 +3215,22 @@
   function switchTab(tabId: string) {
     const tab = tabs.find(t => t.id === tabId);
     if (!tab) return;
-    activeTabId = tabId;
-    if (paneLayout) {
-      const pane = getAllLeaves(paneLayout.root).find(leaf => leaf.tabId === tabId);
-      if (pane) {
-        paneLayout = { ...paneLayout, focusedPaneId: pane.id };
-      } else {
-        const newRoot = deepCloneNode(paneLayout.root);
-        const focusedLeaf = findPane(newRoot, paneLayout.focusedPaneId);
-        if (focusedLeaf && focusedLeaf.type === 'leaf') {
-          (focusedLeaf as PaneLeaf).tabId = tabId;
+    transition(() => {
+      activeTabId = tabId;
+      if (paneLayout) {
+        const pane = getAllLeaves(paneLayout.root).find(leaf => leaf.tabId === tabId);
+        if (pane) {
+          paneLayout = { ...paneLayout, focusedPaneId: pane.id };
+        } else {
+          const newRoot = deepCloneNode(paneLayout.root);
+          const focusedLeaf = findPane(newRoot, paneLayout.focusedPaneId);
+          if (focusedLeaf && focusedLeaf.type === 'leaf') {
+            (focusedLeaf as PaneLeaf).tabId = tabId;
+          }
+          paneLayout = { root: newRoot, focusedPaneId: paneLayout.focusedPaneId };
         }
-        paneLayout = { root: newRoot, focusedPaneId: paneLayout.focusedPaneId };
       }
-    }
+    });
     tick().then(() => {
       scrollToBottom();
       focusInput();
@@ -3132,41 +3254,43 @@
       tuiCanvases[tabId].dispose();
       delete tuiCanvases[tabId];
     }
-    tabs = tabs.filter(t => t.id !== tabId);
 
-    if (tabs.length === 0) {
-      paneLayout = null;
-      createTab();
-      return;
-    }
+    transition(() => {
+      tabs = tabs.filter(t => t.id !== tabId);
 
-    // Pick new active tab if we closed the current one
-    const needSwitch = activeTabId === tabId;
-    if (needSwitch) {
-      const newIdx = Math.min(idx, tabs.length - 1);
-      activeTabId = tabs[newIdx].id;
-    }
+      if (tabs.length === 0) {
+        paneLayout = null;
+        createTab();
+        return;
+      }
 
-    // Update pane layout: if pane shows the closed tab, point it to new active tab
-    // If pane shows a different tab (multi-pane), remove it from layout
-    if (paneLayout) {
-      const pane = getAllLeaves(paneLayout.root).find(leaf => leaf.tabId === tabId);
-      if (pane) {
-        const leaves = getAllLeaves(paneLayout.root);
-        if (leaves.length > 1) {
-          // Multi-pane: remove the pane showing the closed tab
-          const newLayout = closePane(paneLayout, pane.id);
-          if (newLayout) paneLayout = newLayout;
-        } else {
-          // Single pane: just update its tabId to the new active tab
-          const newRoot = deepCloneNode(paneLayout.root);
-          const leaf = findPane(newRoot, pane.id) as PaneLeaf;
-          if (leaf && leaf.type === 'leaf') leaf.tabId = activeTabId;
-          paneLayout = { root: newRoot, focusedPaneId: paneLayout.focusedPaneId };
+      // Pick new active tab if we closed the current one
+      const needSwitch = activeTabId === tabId;
+      if (needSwitch) {
+        const newIdx = Math.min(idx, tabs.length - 1);
+        activeTabId = tabs[newIdx].id;
+      }
+
+      // Update pane layout: if pane shows the closed tab, point it to new active tab
+      // If pane shows a different tab (multi-pane), remove it from layout
+      if (paneLayout) {
+        const pane = getAllLeaves(paneLayout.root).find(leaf => leaf.tabId === tabId);
+        if (pane) {
+          const leaves = getAllLeaves(paneLayout.root);
+          if (leaves.length > 1) {
+            // Multi-pane: remove the pane showing the closed tab
+            const newLayout = closePane(paneLayout, pane.id);
+            if (newLayout) paneLayout = newLayout;
+          } else {
+            // Single pane: just update its tabId to the new active tab
+            const newRoot = deepCloneNode(paneLayout.root);
+            const leaf = findPane(newRoot, pane.id) as PaneLeaf;
+            if (leaf && leaf.type === 'leaf') leaf.tabId = activeTabId;
+            paneLayout = { root: newRoot, focusedPaneId: paneLayout.focusedPaneId };
+          }
         }
       }
-      // If no pane references the closed tab (tab wasn't displayed), nothing to do in layout
-    }
+    });
   }
 
   function scrollIntoAiBlock(el: HTMLElement, active: boolean) {
@@ -3741,10 +3865,6 @@
   <div class="main-area">
     <!-- Titlebar -->
     <header class="titlebar" data-tauri-drag-region>
-      <div class="titlebar-brand" data-tauri-drag-region>
-        <div class="titlebar-brand-mark" aria-hidden="true"></div>
-        <span class="titlebar-brand-text" data-tauri-drag-region>Drover</span>
-      </div>
       {#if currentView === 'settings'}
         <div class="titlebar-settings-nav">
           <button class="titlebar-back" onclick={closeSettings}>Back to Terminal</button>
@@ -3756,8 +3876,8 @@
             <div
               class="tab-item"
               class:active={tab.id === activeTabId}
-              class:drag-over={dragOverTabId === tab.id}
-              class:dragging={dragTabId === tab.id && isDragging}
+              style={tab.id === activeTabId ? 'view-transition-name: active-tab' : ''}
+              class:drag-over={dragOverTabId === tab.id}              class:dragging={dragTabId === tab.id && isDragging}
               data-tab-id={tab.id}
               onclick={() => { if (!isDragging) switchTab(tab.id); }}
               ondblclick={() => startRename(tab.id)}
@@ -3804,6 +3924,7 @@
         <SettingsPage
           bind:aiAccountId
           bind:aiApiToken
+          bind:geminiApiKey
           bind:activeThemeId
           bind:customTheme
           sshSessions={sshSessions}
@@ -3811,6 +3932,8 @@
           mcpServers={mcpServers}
           onSaveSettings={saveSettings}
           onRevokeCredentials={revokeCredentials}
+          onSaveGeminiKey={saveGeminiKey}
+          onRevokeGeminiKey={revokeGeminiKey}
           onSaveTheme={saveThemeToStore}
           onAddSshSession={addSshSession}
           onRemoveSshSession={removeSshSession}
@@ -3921,6 +4044,26 @@
 
                     <!-- AI blocks (history + active) -->
                     {#each getVisibleAiBlocks(paneLeaf.tabId) as block (block.id)}
+                      {#if block.phase === 'passthrough'}
+                        <!-- Inline passthrough command -->
+                        <div class="ai-thread ai-thread-passthrough">
+                          <div class="ai-passthrough-block">
+                            <div class="ai-passthrough-cmd">
+                              <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+                              <code>{block.prompt}</code>
+                              {#if block.commands[0]?.status === 'running'}
+                                <span class="ai-spinner-sm"></span>
+                              {/if}
+                              <button class="ai-block-dismiss" onclick={() => removeAiBlock(block.id)} title="Remove">
+                                <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                              </button>
+                            </div>
+                            {#if block.commands[0]?.output}
+                              <pre class="ai-passthrough-output">{block.commands[0].output}</pre>
+                            {/if}
+                          </div>
+                        </div>
+                      {:else}
                       <div class="ai-thread" use:scrollIntoAiBlock={block.phase !== 'done' && block.phase !== 'error' && block.phase !== 'answered'}>
                         <!-- User question -->
                         <div class="ai-thread-question">
@@ -4159,6 +4302,7 @@
                           {/if}
                         {/if}
                       </div>
+                      {/if}
                     {/each}
                   </div>
 
@@ -4182,7 +4326,7 @@
                           {#each aiAttachments as attachment, i}
                             <div class="ai-attachment-chip">
                               <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="1.5" fill="none"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
-                              <span class="ai-attachment-name" title={attachment.path}>{attachment.name}</span>
+                              <span class="ai-attachment-name" title={attachment.path}>{attachment.path ? relativeFilePath(attachment.path) : attachment.name}</span>
                               <button class="ai-attachment-remove" onclick={() => removeAttachment(i)} title="Remove" aria-label="Remove attachment">
                                 <svg viewBox="0 0 24 24" width="10" height="10" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                               </button>
@@ -4232,6 +4376,9 @@
                                   {/if}
                                 </span>
                                 <span class="at-menu-name">{file.name}</span>
+                                {#if file.path}
+                                  <span class="at-menu-path">{relativeFilePath(file.path)}</span>
+                                {/if}
                               </button>
                             {/each}
                           {:else if atFilter.length > 0}
@@ -4269,7 +4416,7 @@
                           }
                           // @ mention file picker (only in agent mode)
                           if (agenticMode) {
-                            const atMatch = val.match(/@(\w*)$/);
+                            const atMatch = val.match(/@([\w./-]*)$/);
                             if (atMatch) {
                               atFilter = atMatch[1];
                               atMenuOpen = true;
@@ -4298,10 +4445,10 @@
                       <div class="input-toolbar-left">
                         <div class="mode-switch">
                           <button class="mode-switch-btn" class:active={!agenticMode} onclick={() => { agenticMode = false; pendingCommand = ''; }} title="Terminal mode" aria-label="Terminal mode">
-                            <svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+                            Terminal
                           </button>
                           <button class="mode-switch-btn" class:active={agenticMode} onclick={async () => { if (!aiAccountId || !aiApiToken) { openSettings(); return; } agenticMode = true; pendingCommand = ''; await refreshAiSessions(); }} title="AI mode" aria-label="AI mode">
-                            <svg viewBox="0 0 24 24"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path><circle cx="9.5" cy="15.5" r="1"></circle><circle cx="14.5" cy="15.5" r="1"></circle></svg>
+                            Agent
                           </button>
                         </div>
                         {#if agenticMode}
@@ -4321,12 +4468,30 @@
                             </button>
                             {#if aiModelDropdownOpen}
                               <div class="ai-model-dropdown">
-                                <div class="ai-model-dropdown-header">Select Model</div>
-                                {#each CLOUDFLARE_AI_MODELS as model}
+                                <div class="ai-model-dropdown-header">Cloudflare</div>
+                                {#each AI_MODELS.filter(m => m.provider === 'cloudflare') as model}
                                   <button
                                     class="ai-model-item"
                                     class:active={selectedAiModel === model.id}
-                                    onclick={() => selectAiModel(model.id)}
+                                    class:disabled={!aiApiToken}
+                                    onclick={() => { if (aiApiToken) selectAiModel(model.id); }}
+                                    title={!aiApiToken ? 'Configure Kuratchi API in Settings' : ''}
+                                  >
+                                    <div class="ai-model-name">{model.name}</div>
+                                    <div class="ai-model-desc">{model.description}</div>
+                                    {#if selectedAiModel === model.id}
+                                      <svg class="ai-model-check" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                    {/if}
+                                  </button>
+                                {/each}
+                                <div class="ai-model-dropdown-header" style="margin-top: 4px;">Google Gemini</div>
+                                {#each AI_MODELS.filter(m => m.provider === 'gemini') as model}
+                                  <button
+                                    class="ai-model-item"
+                                    class:active={selectedAiModel === model.id}
+                                    class:disabled={!geminiApiKey}
+                                    onclick={() => { if (geminiApiKey) selectAiModel(model.id); }}
+                                    title={!geminiApiKey ? 'Configure Gemini API key in Settings' : ''}
                                   >
                                     <div class="ai-model-name">{model.name}</div>
                                     <div class="ai-model-desc">{model.description}</div>
@@ -4338,15 +4503,18 @@
                               </div>
                             {/if}
                           </div>
-                          <button class="toolbar-icon-btn" class:active={aiSessionsSidebarOpen} onclick={async () => { aiSessionsSidebarOpen = !aiSessionsSidebarOpen; aiModelDropdownOpen = false; toolsDropdownOpen = false; sshDropdownOpen = false; if (aiSessionsSidebarOpen) await refreshAiSessions(); }} title="AI sessions" aria-label="AI sessions">
-                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"></path><path d="M3 12h18"></path><path d="M3 19h18"></path></svg>
+                          <button class="toolbar-text-btn" class:active={aiSessionsSidebarOpen} onclick={async () => { aiSessionsSidebarOpen = !aiSessionsSidebarOpen; aiModelDropdownOpen = false; toolsDropdownOpen = false; sshDropdownOpen = false; if (aiSessionsSidebarOpen) await refreshAiSessions(); }} title="Recent AI sessions" aria-label="Recent AI sessions">
+                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                            <span>Sessions</span>
                           </button>
                         {/if}
-                        <div class="tools-dropdown-wrapper">
-                          <button class="toolbar-icon-btn" class:active={activeTool !== null} onclick={(e) => { e.stopPropagation(); toolsDropdownOpen = !toolsDropdownOpen; sshDropdownOpen = false; aiModelDropdownOpen = false; }} title="Tools" aria-label="Tools">
-                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
-                          </button>
-                          {#if toolsDropdownOpen}
+                        {#if !agenticMode}
+                          <div class="tools-dropdown-wrapper">
+                            <button class="toolbar-text-btn" class:active={activeTool !== null} onclick={(e) => { e.stopPropagation(); toolsDropdownOpen = !toolsDropdownOpen; sshDropdownOpen = false; aiModelDropdownOpen = false; }} title="Tools" aria-label="Tools">
+                              <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
+                              <span>Tools</span>
+                            </button>
+                            {#if toolsDropdownOpen}
                             <div class="tools-dropdown-menu">
                               <button class="tools-dropdown-item" class:active={activeTool === 'dig'} onclick={() => toggleTool('dig')}>
                                 <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
@@ -4382,7 +4550,8 @@
                               </button>
                             </div>
                           {/if}
-                        </div>
+                          </div>
+                        {/if}
                         {#if sshSessions.length > 0}
                           <div class="tools-dropdown-wrapper">
                             <button class="toolbar-icon-btn" class:active={sshDropdownOpen} onclick={(e) => { e.stopPropagation(); sshDropdownOpen = !sshDropdownOpen; toolsDropdownOpen = false; }} title="SSH Sessions" aria-label="SSH Sessions">
@@ -4401,8 +4570,9 @@
                           </div>
                         {/if}
                       </div>
-                      <button class="toolbar-icon-btn" onclick={openSettings} title="Settings" aria-label="Settings">
+                      <button class="toolbar-text-btn" onclick={openSettings} title="Settings" aria-label="Settings">
                         <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                        <span>Settings</span>
                       </button>
                       {#if tab.commandRunning}
                         <div class="input-runtime-hint">

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 const DEFAULT_KURATCHI_BASE_URL: &str = "https://kuratchi.cloud";
 const DEFAULT_KURATCHI_MODEL: &str = "@cf/meta/llama-4-scout-17b-16e-instruct";
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 #[derive(Serialize, Clone)]
 pub struct DiffLine {
@@ -241,6 +242,366 @@ async fn kuratchi_create_session(
     parsed
         .data
         .ok_or_else(|| "Create session response was missing data".to_string())
+}
+
+// ── Gemini API types ──────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct GeminiRequest {
+    contents: Vec<GeminiContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiSystemInstruction>,
+}
+
+#[derive(Serialize)]
+struct GeminiSystemInstruction {
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiContent {
+    role: String,
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum GeminiPart {
+    Text { text: String },
+    InlineData { inline_data: GeminiInlineData },
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiInlineData {
+    mime_type: String,
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponse {
+    candidates: Option<Vec<GeminiCandidate>>,
+    error: Option<GeminiError>,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: GeminiCandidateContent,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidateContent {
+    parts: Vec<GeminiResponsePart>,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponsePart {
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GeminiError {
+    message: String,
+}
+
+async fn gemini_chat(
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    contents: Vec<GeminiContent>,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let body = GeminiRequest {
+        contents,
+        system_instruction: if system_prompt.is_empty() {
+            None
+        } else {
+            Some(GeminiSystemInstruction {
+                parts: vec![GeminiPart::Text {
+                    text: system_prompt.to_string(),
+                }],
+            })
+        },
+    };
+
+    let url = format!(
+        "{}/models/{}:generateContent?key={}",
+        GEMINI_API_BASE, model, api_key
+    );
+
+    let client = build_http_client(timeout_secs)?;
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Gemini request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Gemini API error {}: {}", status, text));
+    }
+
+    let parsed: GeminiResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Gemini response: {}", e))?;
+
+    if let Some(error) = parsed.error {
+        return Err(format!("Gemini error: {}", error.message));
+    }
+
+    let text = parsed
+        .candidates
+        .and_then(|c| c.into_iter().next())
+        .and_then(|c| {
+            c.content
+                .parts
+                .into_iter()
+                .filter_map(|p| p.text)
+                .next()
+        })
+        .ok_or_else(|| "Gemini returned no content".to_string())?;
+
+    Ok(text)
+}
+
+#[tauri::command]
+pub async fn ai_gemini_chat(
+    api_key: String,
+    model: String,
+    prompt: String,
+    attachments: Vec<AiAttachment>,
+    cwd: Option<String>,
+    os_info: Option<String>,
+    shell: Option<String>,
+    ssh_target: Option<String>,
+) -> Result<String, String> {
+    // Load MCP tools
+    let servers = mcp::load_mcp_config();
+    let mut all_tools: Vec<(String, String, Vec<mcp::McpToolDef>)> = Vec::new();
+    for server in &servers {
+        if mcp::read_auth_token(server).is_none() {
+            continue;
+        }
+        match mcp::mcp_list_tools(server.server_url.clone(), server.name.clone()).await {
+            Ok(tools) => {
+                all_tools.push((server.name.clone(), server.server_url.clone(), tools));
+            }
+            Err(e) => {
+                eprintln!("Failed to list tools from {}: {}", server.name, e);
+            }
+        }
+    }
+
+    let has_tools = all_tools.iter().any(|(_, _, t)| !t.is_empty());
+
+    let mut context_lines = Vec::new();
+    if let Some(ref c) = cwd {
+        context_lines.push(format!("Current directory: {}", c));
+    }
+    if let Some(ref o) = os_info {
+        context_lines.push(format!("OS: {}", o));
+    }
+    if let Some(ref s) = shell {
+        context_lines.push(format!("Shell: {}", s));
+    }
+    if let Some(ref t) = ssh_target {
+        context_lines.push(format!("Connected via SSH to: {}", t));
+    }
+
+    let context_block = if context_lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nCurrent environment:\n{}", context_lines.join("\n"))
+    };
+
+    let tools_block = if has_tools {
+        format!("\n\n{}", build_tools_prompt(&all_tools))
+    } else {
+        String::new()
+    };
+
+    let tool_instructions = if has_tools {
+        let example = build_tool_example(&all_tools);
+        format!(r#"
+
+To use an MCP tool, you MUST output a line starting with "TOOL_CALL:" in this exact format:
+TOOL_CALL: server_name | tool_name | {{"param": "value"}}
+{}
+CRITICAL RULES:
+- server_name MUST be the exact name in [brackets] above.
+- tool_name is the full tool name exactly as listed.
+- Arguments must be valid JSON.
+- Every MCP tool invocation MUST use TOOL_CALL: format.
+- Do NOT explain tool calls — just output them."#, example)
+    } else {
+        String::new()
+    };
+
+    // Check if this is an explanation request
+    let prompt_lower = prompt.to_lowercase();
+    let is_explanation = prompt_lower.contains("explain")
+        || prompt_lower.contains("what does")
+        || prompt_lower.contains("how does")
+        || prompt_lower.contains("describe")
+        || prompt_lower.contains("analyze")
+        || prompt_lower.contains("review");
+
+    let has_text_attachments = attachments
+        .iter()
+        .any(|a| !a.mime_type.starts_with("image/") && a.mime_type != "application/pdf");
+
+    let system_prompt = if is_explanation && has_text_attachments {
+        "You are a helpful coding assistant. Explain code clearly and thoroughly. Describe what the code does, how it works, and any important patterns or concepts used. Be direct and informative.".to_string()
+    } else {
+        format!(
+            r#"You are an expert terminal assistant in Drover. The user describes tasks in natural language and you respond with executable shell commands OR MCP tool calls.
+
+Rules:
+- Respond with ONLY executable shell commands (one per line) or TOOL_CALL directives.
+- No explanations, no markdown, no code fences, no commentary.
+- ALWAYS single-quote URLs that contain special shell characters (?, &, =, #, etc.).
+- If a task is dangerous, respond with: ERROR: <reason>
+- If the question is conversational or doesn't need commands, respond with: ANSWER: <your response>{}{}{}"#,
+            context_block, tools_block, tool_instructions
+        )
+    };
+
+    // Build Gemini contents
+    let mut parts: Vec<GeminiPart> = Vec::new();
+
+    // Add text prompt
+    let mut user_text = prompt.clone();
+    for attachment in &attachments {
+        if !attachment.mime_type.starts_with("image/") && attachment.mime_type != "application/pdf" {
+            user_text.push_str(&format!("\n\n--- {} ---\n{}", attachment.name, attachment.content));
+        }
+    }
+    parts.push(GeminiPart::Text {
+        text: user_text,
+    });
+
+    // Add image attachments as inline data
+    for attachment in &attachments {
+        if attachment.mime_type.starts_with("image/") {
+            parts.push(GeminiPart::InlineData {
+                inline_data: GeminiInlineData {
+                    mime_type: attachment.mime_type.clone(),
+                    data: attachment.content.clone(),
+                },
+            });
+        }
+    }
+
+    let contents = vec![GeminiContent {
+        role: "user".to_string(),
+        parts,
+    }];
+
+    let reply = gemini_chat(&api_key, &model, &system_prompt, contents, 60).await?;
+
+    // Prefix explanation responses with ANSWER:
+    if is_explanation && has_text_attachments && !reply.starts_with("ANSWER:") {
+        Ok(format!("ANSWER: {}", reply))
+    } else {
+        Ok(reply)
+    }
+}
+
+#[tauri::command]
+pub async fn ai_gemini_edit_code(
+    api_key: String,
+    model: String,
+    file_name: String,
+    file_path: Option<String>,
+    file_content: String,
+    instruction: String,
+) -> Result<CodeEditResult, String> {
+    let system_prompt = r#"You are an expert code editor. The user will provide a code file and an instruction for how to modify it.
+
+Your task:
+1. Analyze the existing code
+2. Make the requested modifications
+3. Return ONLY the complete modified file content
+
+Rules:
+- Return the ENTIRE modified file, not just the changed parts
+- Preserve the original code style, indentation, and formatting
+- Do not add explanatory comments unless specifically requested
+- Do not wrap the code in markdown code fences
+- Output ONLY the modified code, nothing else"#;
+
+    let user_content = format!(
+        "File: {}\n\nOriginal code:\n{}\n\nInstruction: {}",
+        file_name, file_content, instruction
+    );
+
+    let contents = vec![GeminiContent {
+        role: "user".to_string(),
+        parts: vec![GeminiPart::Text { text: user_content }],
+    }];
+
+    let modified = gemini_chat(&api_key, &model, system_prompt, contents, 60).await?;
+
+    let diff_lines = generate_diff(&file_content, &modified);
+    let summary = generate_edit_summary(&file_content, &modified, &instruction);
+
+    Ok(CodeEditResult {
+        file_name,
+        file_path,
+        original: file_content,
+        modified,
+        diff_lines,
+        summary,
+    })
+}
+
+#[tauri::command]
+pub async fn ai_gemini_edit_code_from_path(
+    api_key: String,
+    model: String,
+    file_path: String,
+    instruction: String,
+    cwd: Option<String>,
+) -> Result<CodeEditResult, String> {
+    use std::path::PathBuf;
+
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+
+    let expand_tilde = |p: &str| -> String {
+        if p.starts_with('~') {
+            p.replacen('~', &home, 1)
+        } else {
+            p.to_string()
+        }
+    };
+
+    let resolved_path = if file_path.starts_with('/') || file_path.contains(':') {
+        file_path.clone()
+    } else if file_path.starts_with('~') {
+        expand_tilde(&file_path)
+    } else if let Some(ref cwd) = cwd {
+        let expanded_cwd = expand_tilde(cwd);
+        let mut path = PathBuf::from(&expanded_cwd);
+        path.push(&file_path);
+        path.to_string_lossy().to_string()
+    } else {
+        file_path.clone()
+    };
+
+    let file_content = std::fs::read_to_string(&resolved_path)
+        .map_err(|e| format!("Failed to read file '{}': {}", resolved_path, e))?;
+
+    let file_name = PathBuf::from(&resolved_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.clone());
+
+    ai_gemini_edit_code(api_key, model, file_name, Some(resolved_path), file_content, instruction).await
 }
 
 #[tauri::command]

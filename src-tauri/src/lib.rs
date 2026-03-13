@@ -102,7 +102,10 @@ pub fn run() {
             ai::ai_summarize_tool_results,
             ai::ai_retry,
             ai::ai_edit_code,
-            ai::ai_edit_code_from_path
+            ai::ai_edit_code_from_path,
+            ai::ai_gemini_chat,
+            ai::ai_gemini_edit_code,
+            ai::ai_gemini_edit_code_from_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
