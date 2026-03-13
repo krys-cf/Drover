@@ -30,7 +30,7 @@
     sshSessions: SshSession[];
     savedCommands: SavedCommand[];
     mcpServers: McpServerEntry[];
-    onSaveSettings: (accountId: string, apiToken: string) => Promise<void>;
+    onSaveSettings: (baseUrl: string, apiToken: string) => Promise<void>;
     onRevokeCredentials: () => Promise<void>;
     onSaveTheme: () => Promise<void>;
     onAddSshSession: (nickname: string, command: string) => void;
@@ -143,59 +143,59 @@
   <div class="settings-panel">
     {#if settingsTab === 'ai'}
       <section class="settings-section">
-        <h2 class="settings-section-title">Cloudflare Workers AI</h2>
-        <p class="settings-section-desc">Configure your Cloudflare credentials to enable the AI-powered agentic terminal mode. Your credentials are stored locally on this device.</p>
+        <h2 class="settings-section-title">Kuratchi AI</h2>
+        <p class="settings-section-desc">Configure Drover to use your Kuratchi platform as the AI API source. The base URL is stored locally and the platform token stays in secure local storage.</p>
 
         <div class="settings-field">
-          <label class="settings-label" for="ai-account-id">Account ID</label>
+          <label class="settings-label" for="ai-account-id">Base URL</label>
           <input
             id="ai-account-id"
             class="settings-input"
             type="text"
             bind:value={settingsAccountId}
-            placeholder="Enter your Cloudflare Account ID"
+            placeholder="https://kuratchi.cloud"
             spellcheck="false"
           />
-          <span class="settings-hint">Found in your Cloudflare Dashboard under Workers AI</span>
+          <span class="settings-hint">Kuratchi API origin, for example https://kuratchi.cloud</span>
         </div>
 
         <div class="settings-field">
-          <label class="settings-label" for="ai-api-token">API Token</label>
+          <label class="settings-label" for="ai-api-token">Platform Token</label>
           <div class="settings-input-group">
             <input
               id="ai-api-token"
               class="settings-input"
               type={showToken ? 'text' : 'password'}
               bind:value={settingsApiToken}
-              placeholder="Enter your Workers AI API token"
+              placeholder="kdbp_..."
               spellcheck="false"
             />
             <button class="settings-reveal-btn" onclick={() => { showToken = !showToken; }} title={showToken ? 'Hide token' : 'Show token'}>
               {showToken ? 'Hide' : 'Show'}
             </button>
           </div>
-          <span class="settings-hint">Requires Workers AI permissions</span>
+          <span class="settings-hint">Use the Kuratchi platform token issued for this org or app</span>
         </div>
 
         {#if aiAccountId && aiApiToken}
           <div class="settings-status settings-status-active">
             <span class="settings-status-dot active"></span>
-            <span>Credentials configured — AI mode available</span>
+            <span>Kuratchi API configured and ready</span>
           </div>
         {:else}
           <div class="settings-status settings-status-inactive">
             <span class="settings-status-dot"></span>
-            <span>No credentials — AI mode disabled</span>
+            <span>No Kuratchi config and AI mode is disabled</span>
           </div>
         {/if}
 
         <div class="settings-actions">
           <button class="settings-btn-save" onclick={handleSave} disabled={!settingsAccountId.trim() || !settingsApiToken.trim()}>
-            {settingsSaved ? '✓ Saved' : 'Save Credentials'}
+            {settingsSaved ? 'Saved' : 'Save Configuration'}
           </button>
           {#if aiAccountId || aiApiToken}
             <button class="settings-btn-revoke" onclick={handleRevoke}>
-              Revoke Credentials
+              Clear Configuration
             </button>
           {/if}
         </div>
