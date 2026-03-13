@@ -97,6 +97,8 @@ pub fn run() {
             mcp::mcp_list_tools,
             mcp::mcp_call_tool,
             ai::ai_chat_with_tools,
+            ai::ai_list_sessions,
+            ai::ai_create_session,
             ai::ai_summarize_tool_results,
             ai::ai_retry,
             ai::ai_edit_code,

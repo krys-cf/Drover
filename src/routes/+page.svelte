@@ -5,6 +5,7 @@
   import { load } from '@tauri-apps/plugin-store';
   import { Client, Stronghold } from '@tauri-apps/plugin-stronghold';
   import { appDataDir, homeDir as getHomeDir } from '@tauri-apps/api/path';
+  import { AgentClient } from 'agents/client';
   import { TerminalEmulator, keyToSequence, encodeMouseEvent, type CellStyle } from '$lib/terminal-emulator';
   import { TerminalCanvas } from '$lib/terminal-canvas';
   import { THEMES, applyThemeCssVars, highlightPrompt as themeHighlightPrompt, isBarePrompt, highlightOutput, type TerminalTheme } from '$lib/theme';
@@ -237,9 +238,70 @@
     content: string;
     mimeType: string;
   }
+  interface AiSessionSummary {
+    id: string;
+    title?: string | null;
+    model: string;
+    lastUserMessage?: string | null;
+    lastAssistantMessage?: string | null;
+    messageCount: number;
+    created_at: string;
+    updated_at: string;
+  }
+  interface AiChatTurn {
+    session_id: string;
+    response: string;
+  }
+  interface LiveIdeState {
+    sessionId: string;
+    organizationId: string;
+    model: string;
+    phase: 'idle' | 'thinking' | 'approval' | 'executing' | 'answered' | 'needs_input' | 'error';
+    prompt: string;
+    raw: string;
+    response: string;
+    error: string;
+    commands: AiCmdEntry[];
+  }
+  interface LiveAgentConnectResponse {
+    session: AiSessionSummary;
+    agent: {
+      agent: string;
+      name: string;
+      host: string;
+      protocol: 'ws' | 'wss';
+      query: Record<string, string>;
+      expiresAt: string;
+    };
+  }
+  interface AiSessionDetailState {
+    sessionId: string;
+    organizationId: string;
+    model: string;
+    phase: 'idle' | 'thinking' | 'approval' | 'executing' | 'answered' | 'needs_input' | 'error';
+    prompt: string;
+    raw: string;
+    response: string;
+    error: string;
+    commands: AiCmdEntry[];
+  }
+  interface AiSessionDetail extends AiSessionSummary {
+    state: AiSessionDetailState | null;
+  }
   let aiAttachments = $state<AiAttachment[]>([]);
   let aiModelDropdownOpen = $state(false);
   let selectedAiModel = $state('@cf/meta/llama-4-scout-17b-16e-instruct');
+  let aiSessions = $state<AiSessionSummary[]>([]);
+  let aiSessionsSidebarOpen = $state(false);
+  let aiSessionSearch = $state('');
+  let aiSessionsLoading = $state(false);
+  let aiSessionsError = $state('');
+  let aiSessionActionError = $state('');
+  let currentAiSessionId = $state('');
+  let liveAgentActiveBlockId = $state(0);
+  let liveAgentConnecting = $state(false);
+  let liveAgentSessionName = $state('');
+  let liveAgentClient: AgentClient<LiveIdeState> | null = null;
   
   // Code editing state
   interface DiffLine {
@@ -516,7 +578,9 @@
   async function loadSettings() {
     try {
       const store = await load('settings.json', { autoSave: true, defaults: {} });
-      aiAccountId = (await store.get<string>('ai_account_id')) || '';
+      aiAccountId = (await store.get<string>('kuratchi_base_url'))
+        || (await store.get<string>('ai_account_id'))
+        || '';
       const savedThemeId = await store.get<string>('theme_id');
       if (savedThemeId && THEMES[savedThemeId]) {
         activeThemeId = savedThemeId;
@@ -544,9 +608,13 @@
       console.error('Failed to load store settings:', e);
     }
     try {
-      aiApiToken = await strongholdGet('ai_api_token');
+      aiApiToken = await strongholdGet('kuratchi_api_token');
+      if (!aiApiToken) aiApiToken = await strongholdGet('ai_api_token');
     } catch (e) {
       console.error('Failed to load stronghold token:', e);
+    }
+    if (aiAccountId && aiApiToken) {
+      await refreshAiSessions();
     }
   }
 
@@ -967,14 +1035,245 @@
     setTimeout(() => updateTabState(tab), 1500);
   }
 
+  async function refreshAiSessions() {
+    if (!aiAccountId || !aiApiToken) {
+      aiSessions = [];
+      aiSessionsError = '';
+      aiSessionActionError = '';
+      return;
+    }
+    aiSessionsLoading = true;
+    aiSessionsError = '';
+    try {
+      aiSessions = await invoke<AiSessionSummary[]>('ai_list_sessions', {
+        baseUrl: aiAccountId,
+        apiToken: aiApiToken,
+      });
+    } catch (e) {
+      aiSessions = [];
+      aiSessionsError = String(e);
+    } finally {
+      aiSessionsLoading = false;
+    }
+  }
+
+  function getFilteredAiSessions(): AiSessionSummary[] {
+    const query = aiSessionSearch.trim().toLowerCase();
+    if (!query) return aiSessions;
+    return aiSessions.filter((session) => {
+      const haystacks = [
+        session.title || '',
+        session.lastUserMessage || '',
+        session.lastAssistantMessage || '',
+        session.model || '',
+      ];
+      return haystacks.some((value) => value.toLowerCase().includes(query));
+    });
+  }
+
+  function clearAiBlocksForTab(tabId: string) {
+    aiBlocks = aiBlocks.filter((block) => block.tabId !== tabId);
+  }
+
+  async function loadAiSessionDetail(sessionId: string): Promise<AiSessionDetail> {
+    return kuratchiRequest<AiSessionDetail>(`/api/v1/ai/sessions/${sessionId}`);
+  }
+
+  function restoreAiSessionIntoTab(tabId: string, detail: AiSessionDetail) {
+    clearAiBlocksForTab(tabId);
+
+    const state = detail.state;
+    if (!state) return;
+
+    const restoredBlock = createAiBlock(tabId, {
+      prompt: state.prompt || detail.lastUserMessage || '',
+      attachments: [],
+      phase: mapLivePhase(state.phase),
+      commands: state.commands || [],
+      toolCalls: [],
+      error: state.error || '',
+      raw: state.raw || '',
+      response: state.response || detail.lastAssistantMessage || '',
+    });
+
+    if (restoredBlock.phase !== 'done' && restoredBlock.phase !== 'error' && restoredBlock.phase !== 'answered') {
+      activeBlockId = restoredBlock.id;
+    }
+  }
+
+  async function createAiSession(title?: string) {
+    const session = await invoke<AiSessionSummary>('ai_create_session', {
+      baseUrl: aiAccountId,
+      apiToken: aiApiToken,
+      title: title || null,
+      model: selectedAiModel,
+    });
+    currentAiSessionId = session.id;
+    await refreshAiSessions();
+    return session;
+  }
+
+  async function resumeAiSession(session: AiSessionSummary) {
+    const tab = focusedTab();
+    if (!tab) return;
+    if (liveAgentClient && currentAiSessionId !== session.id) {
+      liveAgentClient.close();
+      liveAgentClient = null;
+      liveAgentSessionName = '';
+    }
+    currentAiSessionId = session.id;
+    selectedAiModel = session.model || selectedAiModel;
+    agenticMode = true;
+    aiSessionsSidebarOpen = true;
+    aiSessionActionError = '';
+    try {
+      const detail = await loadAiSessionDetail(session.id);
+      restoreAiSessionIntoTab(tab.id, detail);
+      await ensureLiveAgentConnection();
+    } catch (e) {
+      aiSessionActionError = String(e);
+    }
+    tick().then(() => focusInput());
+  }
+
+  function startNewAiSession() {
+    currentAiSessionId = '';
+    if (liveAgentClient) {
+      liveAgentClient.close();
+      liveAgentClient = null;
+      liveAgentSessionName = '';
+    }
+    aiSessionsSidebarOpen = true;
+    aiSessionSearch = '';
+    aiSessionActionError = '';
+    const tab = focusedTab();
+    if (tab) clearAiBlocksForTab(tab.id);
+    tick().then(() => focusInput());
+  }
+
+  function normalizeBaseUrl(value: string): string {
+    const trimmed = value.trim();
+    return trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed;
+  }
+
+  async function kuratchiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const response = await fetch(`${normalizeBaseUrl(aiAccountId)}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aiApiToken}`,
+        ...(init.headers || {}),
+      },
+    });
+
+    const payload = await response.json().catch(() => null) as { success?: boolean; data?: T; error?: string } | null;
+    if (!response.ok || !payload?.success) {
+      throw new Error(payload?.error || `Request failed with ${response.status}`);
+    }
+    return payload.data as T;
+  }
+
+  function mapLivePhase(phase: LiveIdeState['phase']): AiBlock['phase'] {
+    switch (phase) {
+      case 'thinking': return 'thinking';
+      case 'approval': return 'commands';
+      case 'executing': return 'executing';
+      case 'needs_input': return 'needs_input';
+      case 'answered': return 'answered';
+      case 'error': return 'error';
+      default: return 'done';
+    }
+  }
+
+  function syncAiBlockFromLiveState(state: LiveIdeState) {
+    const blockId = liveAgentActiveBlockId;
+    if (!blockId) return;
+    updateAiBlock(blockId, {
+      prompt: state.prompt || aiBlocks.find((block) => block.id === blockId)?.prompt || '',
+      phase: mapLivePhase(state.phase),
+      commands: state.commands || [],
+      raw: state.raw || '',
+      response: state.response || '',
+      error: state.error || '',
+    });
+    if (state.sessionId) currentAiSessionId = state.sessionId;
+    if (state.phase === 'approval' && aiExecMode === 'auto') {
+      activeBlockId = blockId;
+      void executePendingCommand();
+    }
+  }
+
+  function buildLivePromptOptions(tab: Tab) {
+    return {
+      model: selectedAiModel,
+      cwd: tab.cwd || null,
+      osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
+      shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
+      sshTarget: tab.sshTarget || null,
+      attachments: aiAttachments.map((attachment) => ({
+        name: attachment.name,
+        content: attachment.content,
+        mimeType: attachment.mimeType,
+      })),
+    };
+  }
+
+  async function ensureLiveAgentConnection(): Promise<AgentClient<LiveIdeState>> {
+    if (liveAgentClient && liveAgentSessionName && currentAiSessionId && liveAgentSessionName.endsWith(`:${currentAiSessionId}`)) {
+      return liveAgentClient;
+    }
+
+    liveAgentConnecting = true;
+    try {
+      const connection = await kuratchiRequest<LiveAgentConnectResponse>('/api/v1/ai/ide/connect', {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: currentAiSessionId || null,
+          model: selectedAiModel,
+        }),
+      });
+
+      currentAiSessionId = connection.session.id;
+      if (liveAgentClient) liveAgentClient.close();
+
+      liveAgentClient = new AgentClient<LiveIdeState>({
+        agent: connection.agent.agent,
+        name: connection.agent.name,
+        host: connection.agent.host,
+        protocol: connection.agent.protocol,
+        query: connection.agent.query,
+        onIdentity: (name) => {
+          liveAgentSessionName = name;
+        },
+        onStateUpdate: (state) => {
+          syncAiBlockFromLiveState(state);
+        },
+      });
+      await Promise.race([
+        liveAgentClient.ready,
+        new Promise<never>((_, reject) => {
+          window.setTimeout(() => reject(new Error('Timed out connecting to Kuratchi live agent')), 8000);
+        }),
+      ]);
+      liveAgentSessionName = liveAgentClient.name;
+      await refreshAiSessions();
+      return liveAgentClient;
+    } finally {
+      liveAgentConnecting = false;
+    }
+  }
+
   async function saveSettings(accountId: string, apiToken: string) {
     try {
       const store = await load('settings.json', { autoSave: true, defaults: {} });
+      await store.set('kuratchi_base_url', accountId);
       await store.set('ai_account_id', accountId);
       await store.save();
+      await strongholdInsert('kuratchi_api_token', apiToken);
       await strongholdInsert('ai_api_token', apiToken);
       aiAccountId = accountId;
       aiApiToken = apiToken;
+      await refreshAiSessions();
     } catch (e) {
       console.error('Failed to save settings:', e);
     }
@@ -983,11 +1282,15 @@
   async function revokeCredentials() {
     try {
       const store = await load('settings.json', { autoSave: true, defaults: {} });
+      await store.set('kuratchi_base_url', '');
       await store.set('ai_account_id', '');
       await store.save();
+      await strongholdRemove('kuratchi_api_token');
       await strongholdRemove('ai_api_token');
       aiAccountId = '';
       aiApiToken = '';
+      aiSessions = [];
+      currentAiSessionId = '';
       agenticMode = false;
     } catch (e) {
       console.error('Failed to revoke credentials:', e);
@@ -1730,7 +2033,7 @@
       try {
         console.log('[AI] Code edit request detected for:', textFileAttachment.name);
         const editResult: CodeEditResult = await invoke('ai_edit_code', {
-          accountId: aiAccountId,
+          baseUrl: aiAccountId,
           apiToken: aiApiToken,
           model: selectedAiModel,
           fileName: textFileAttachment.name,
@@ -1766,7 +2069,7 @@
       try {
         console.log('[AI] Code edit from path detected:', detectedFilePath);
         const editResult: CodeEditResult = await invoke('ai_edit_code_from_path', {
-          accountId: aiAccountId,
+          baseUrl: aiAccountId,
           apiToken: aiApiToken,
           model: selectedAiModel,
           filePath: detectedFilePath,
@@ -1795,11 +2098,24 @@
       }
     }
 
+    try {
+      const client = await ensureLiveAgentConnection();
+      liveAgentActiveBlockId = block.id;
+      await client.call('submitPrompt', [input, buildLivePromptOptions(tab)]);
+      aiAttachments = [];
+      aiLoading = false;
+      pendingCommand = '';
+      return;
+    } catch (e) {
+      console.error('Live agent submit failed, falling back to REST path:', e);
+    }
+
     // Step 1: Get commands/tool calls from AI (MCP-aware)
     const aiParams = {
-      accountId: aiAccountId,
+      baseUrl: aiAccountId,
       apiToken: aiApiToken,
       model: selectedAiModel,
+      sessionId: currentAiSessionId || null,
       prompt: input,
       attachments: aiAttachments.map(a => ({
         name: a.name,
@@ -1811,10 +2127,12 @@
       shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
       sshTarget: tab.sshTarget || null,
     };
-    let response: string;
+    let turn: AiChatTurn;
     console.log('[AI] Sending request with attachments:', aiParams.attachments.length, aiParams.attachments.map(a => ({ name: a.name, mimeType: a.mimeType, contentLen: a.content?.length })));
     try {
-      response = await invoke('ai_chat_with_tools', aiParams);
+      turn = await invoke('ai_chat_with_tools', aiParams);
+      if (turn.session_id) currentAiSessionId = turn.session_id;
+      await refreshAiSessions();
       // Clear attachments after successful request
       aiAttachments = [];
     } catch (e) {
@@ -1825,8 +2143,8 @@
     }
 
     // Step 2: Parse response — separate TOOL_CALL lines from shell commands
-    console.log('[ai_chat_with_tools] raw response:', response);
-    const rawText = response.trim();
+    console.log('[ai_chat_with_tools] raw response:', turn.response);
+    const rawText = turn.response.trim();
     
     // Handle direct answers (e.g., from vision model image analysis)
     if (rawText.startsWith('ANSWER:')) {
@@ -1972,7 +2290,7 @@
         scrollToBottom();
         try {
           const retryResponse: string = await invoke('ai_retry', {
-            accountId: aiAccountId,
+            baseUrl: aiAccountId,
             apiToken: aiApiToken,
             originalPrompt: input,
             failedAttempts,
@@ -2036,7 +2354,7 @@
         let summary: string;
         if (hasToolCalls) {
           summary = await invoke('ai_summarize_tool_results', {
-            accountId: aiAccountId,
+            baseUrl: aiAccountId,
             apiToken: aiApiToken,
             originalPrompt: input,
             toolResults,
@@ -2044,7 +2362,7 @@
           });
         } else {
           summary = await invoke('ai_summarize', {
-            accountId: aiAccountId,
+            baseUrl: aiAccountId,
             apiToken: aiApiToken,
             originalPrompt: input,
             commandResults,
@@ -2136,6 +2454,7 @@
   async function executeBlockInline(tab: Tab, blockId: number) {
     const block = aiBlocks.find(b => b.id === blockId);
     if (!block) return;
+    const failedAttempts: { command: string; error: string }[] = [];
 
     for (let i = 0; i < block.commands.length; i++) {
       block.commands[i].status = 'running';
@@ -2168,12 +2487,38 @@
       } catch (e) {
         block.commands[i].status = 'error';
         block.commands[i].output = String(e);
+        failedAttempts.push({ command: block.commands[i].text, error: String(e) });
         console.error(`Failed to execute command ${i + 1}:`, e);
         updateAiBlock(blockId, { commands: [...block.commands] });
         break;
       }
       updateAiBlock(blockId, { commands: [...block.commands] });
       scrollToBottom();
+    }
+
+    if (liveAgentClient && currentAiSessionId) {
+      try {
+        if (failedAttempts.length > 0) {
+          await liveAgentClient.call('retryPrompt', [block.prompt, failedAttempts, buildLivePromptOptions(tab)]);
+          pendingCommand = '';
+          await tick();
+          scrollToBottom();
+          return;
+        }
+
+        const commandResults = block.commands.map((command) => ({
+          command: command.text,
+          output: command.output,
+        }));
+        await liveAgentClient.call('submitExecutionResults', [block.prompt, commandResults]);
+        pendingCommand = '';
+        await tick();
+        scrollToBottom();
+        setTimeout(() => updateTabState(tab), 500);
+        return;
+      } catch (e) {
+        console.error('Live execution finalize failed:', e);
+      }
     }
 
     updateAiBlock(blockId, { phase: 'done' });
@@ -2188,6 +2533,14 @@
     if (!tab || !pendingCommand || !tab.connected) return;
     pendingCommand = '';
     updateAiBlock(activeBlockId, { phase: 'executing' });
+    if (liveAgentClient && currentAiSessionId) {
+      const block = aiBlocks.find(b => b.id === activeBlockId);
+      if (block) {
+        void liveAgentClient.call('markExecuting', [block.commands]).catch((error) => {
+          console.error('Failed to mark live execution state:', error);
+        });
+      }
+    }
     await executeBlockInline(tab, activeBlockId);
   }
 
@@ -2208,6 +2561,11 @@
     if (!tab) return;
     pendingCommand = '';
     aiExecPromptShown = false;
+    if (liveAgentClient && currentAiSessionId) {
+      void liveAgentClient.call('rejectPrompt', ['Execution dismissed by user']).catch((error) => {
+        console.error('Failed to reject live prompt:', error);
+      });
+    }
     // Only remove the active block (choosing/thinking/commands), keep history
     const active = getActiveAiBlock(tab.id);
     if (active) removeAiBlock(active.id);
@@ -3300,6 +3658,7 @@
       resizeObserver?.disconnect();
       unlistenOutput?.();
       unlistenEnded?.();
+      liveAgentClient?.close();
     };
   });
 </script>
@@ -3320,6 +3679,63 @@
       onAddToChat={(entry) => addFileToChat(entry)}
       getInitialCwd={getFileExplorerCwd}
     />
+  {/if}
+  {#if aiSessionsSidebarOpen}
+    <aside style="width: 320px; min-width: 320px; max-width: 320px; border-right: 1px solid var(--border-subtle); background: color-mix(in srgb, var(--bg-elevated) 88%, black); display: flex; flex-direction: column;">
+      <div style="padding: 14px 14px 10px; border-bottom: 1px solid var(--border-subtle); display: flex; align-items: center; justify-content: space-between; gap: 10px;">
+        <div>
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted);">AI Sessions</div>
+          <div style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">Resume, search, and review prior runs</div>
+        </div>
+        <button class="toolbar-icon-btn" onclick={() => aiSessionsSidebarOpen = false} title="Close sessions" aria-label="Close sessions">
+          <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div style="padding: 12px 14px; border-bottom: 1px solid var(--border-subtle); display: flex; flex-direction: column; gap: 10px;">
+        <button class="ai-action-btn ai-action-btn-primary" style="width: 100%; justify-content: center;" onclick={startNewAiSession}>
+          <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          New session
+        </button>
+        <input
+          type="text"
+          bind:value={aiSessionSearch}
+          placeholder="Search sessions"
+          spellcheck="false"
+          style="width: 100%; border: 1px solid var(--border-subtle); background: var(--bg-base); color: var(--text-primary); border-radius: 10px; padding: 10px 12px; font: inherit;"
+        />
+      </div>
+      <div style="flex: 1; overflow: auto; padding: 10px;">
+        {#if aiSessionActionError}
+          <div style="padding: 12px; color: var(--term-red); white-space: pre-wrap; border: 1px solid color-mix(in srgb, var(--term-red) 35%, transparent); border-radius: 12px; margin-bottom: 10px; background: color-mix(in srgb, var(--term-red) 10%, var(--bg-base));">{aiSessionActionError}</div>
+        {/if}
+        {#if aiSessionsLoading}
+          <div style="padding: 12px; color: var(--text-muted);">Loading sessions...</div>
+        {:else if aiSessionsError}
+          <div style="padding: 12px; color: var(--term-red); white-space: pre-wrap;">{aiSessionsError}</div>
+        {:else if getFilteredAiSessions().length === 0}
+          <div style="padding: 12px; color: var(--text-muted);">{aiSessionSearch ? 'No sessions match your search.' : 'No sessions yet.'}</div>
+        {:else}
+          {#each getFilteredAiSessions() as session}
+            <button
+              onclick={() => resumeAiSession(session)}
+              style="width: 100%; text-align: left; padding: 12px; border: 1px solid color-mix(in srgb, var(--border-subtle) 90%, transparent); background: {currentAiSessionId === session.id ? 'color-mix(in srgb, var(--accent-primary) 14%, var(--bg-base))' : 'var(--bg-base)'}; color: var(--text-primary); border-radius: 12px; display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px;"
+            >
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
+                <span style="font-weight: 600; font-size: 13px;">{session.title || session.lastUserMessage || 'Untitled session'}</span>
+                <span style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">{session.updated_at}</span>
+              </div>
+              {#if session.lastUserMessage}
+                <div style="font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{session.lastUserMessage}</div>
+              {/if}
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text-muted);">
+                <span>{session.model}</span>
+                <span>{session.messageCount} turns</span>
+              </div>
+            </button>
+          {/each}
+        {/if}
+      </div>
+    </aside>
   {/if}
   <div class="main-area">
     <!-- Titlebar -->
@@ -3883,7 +4299,7 @@
                           <button class="mode-switch-btn" class:active={!agenticMode} onclick={() => { agenticMode = false; pendingCommand = ''; }} title="Terminal mode" aria-label="Terminal mode">
                             <svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
                           </button>
-                          <button class="mode-switch-btn" class:active={agenticMode} onclick={() => { if (!aiAccountId || !aiApiToken) { openSettings(); return; } agenticMode = true; pendingCommand = ''; }} title="AI mode" aria-label="AI mode">
+                          <button class="mode-switch-btn" class:active={agenticMode} onclick={async () => { if (!aiAccountId || !aiApiToken) { openSettings(); return; } agenticMode = true; pendingCommand = ''; await refreshAiSessions(); }} title="AI mode" aria-label="AI mode">
                             <svg viewBox="0 0 24 24"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.27a7 7 0 0 1-12.46 0H6a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"></path><circle cx="9.5" cy="15.5" r="1"></circle><circle cx="14.5" cy="15.5" r="1"></circle></svg>
                           </button>
                         </div>
@@ -3921,6 +4337,9 @@
                               </div>
                             {/if}
                           </div>
+                          <button class="toolbar-icon-btn" class:active={aiSessionsSidebarOpen} onclick={async () => { aiSessionsSidebarOpen = !aiSessionsSidebarOpen; aiModelDropdownOpen = false; toolsDropdownOpen = false; sshDropdownOpen = false; if (aiSessionsSidebarOpen) await refreshAiSessions(); }} title="AI sessions" aria-label="AI sessions">
+                            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"></path><path d="M3 12h18"></path><path d="M3 19h18"></path></svg>
+                          </button>
                         {/if}
                         <div class="tools-dropdown-wrapper">
                           <button class="toolbar-icon-btn" class:active={activeTool !== null} onclick={(e) => { e.stopPropagation(); toolsDropdownOpen = !toolsDropdownOpen; sshDropdownOpen = false; aiModelDropdownOpen = false; }} title="Tools" aria-label="Tools">

@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use std::time::Duration;
 
-const AI_API_BASE: &str = "https://api.cloudflare.com/client/v4/accounts/{}/ai/run/";
+const DEFAULT_KURATCHI_BASE_URL: &str = "https://kuratchi.cloud";
+const DEFAULT_KURATCHI_MODEL: &str = "@cf/meta/llama-4-scout-17b-16e-instruct";
 
 #[derive(Serialize, Clone)]
 pub struct DiffLine {
@@ -59,34 +60,192 @@ pub struct AiAttachment {
 }
 
 #[derive(Serialize)]
-struct AiRequest {
-    messages: Vec<AiMessage>,
-    max_tokens: u32,
+struct KuratchiMessage {
+    role: String,
+    content: String,
 }
 
 #[derive(Serialize)]
-struct VisionRequest {
-    messages: Vec<AiMessage>,
-    max_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    image: Option<String>,  // base64 data URL for vision models
+#[serde(rename_all = "camelCase")]
+struct KuratchiChatRequest {
+    session_id: Option<String>,
+    model: Option<String>,
+    messages: Vec<KuratchiMessage>,
 }
 
 #[derive(Deserialize)]
-struct AiResultInner {
-    response: Option<String>,
+#[serde(rename_all = "camelCase")]
+struct KuratchiChatData {
+    session_id: String,
+    reply: String,
 }
 
 #[derive(Deserialize)]
-struct AiResponse {
-    result: Option<AiResultInner>,
+struct KuratchiChatEnvelope {
     success: bool,
-    errors: Vec<serde_json::Value>,
+    data: Option<KuratchiChatData>,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct KuratchiSessionSummary {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub model: String,
+    #[serde(default, alias = "lastUserMessage")]
+    pub last_user_message: Option<String>,
+    #[serde(default, alias = "lastAssistantMessage")]
+    pub last_assistant_message: Option<String>,
+    #[serde(default, alias = "messageCount")]
+    pub message_count: i32,
+    #[serde(alias = "createdAt")]
+    pub created_at: String,
+    #[serde(alias = "updatedAt")]
+    pub updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct KuratchiSessionsEnvelope {
+    success: bool,
+    data: Option<Vec<KuratchiSessionSummary>>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionRequest {
+    title: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateSessionEnvelope {
+    success: bool,
+    data: Option<KuratchiSessionSummary>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AiChatTurn {
+    pub session_id: String,
+    pub response: String,
+}
+
+fn kuratchi_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        DEFAULT_KURATCHI_BASE_URL.to_string()
+    } else {
+        trimmed.trim_end_matches('/').to_string()
+    }
+}
+
+fn build_kuratchi_url(base_url: &str, path: &str) -> String {
+    format!("{}/api/v1{}", kuratchi_base_url(base_url), path)
+}
+
+fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))
+}
+
+fn message_to_kuratchi(message: AiMessage) -> Result<KuratchiMessage, String> {
+    match message.content {
+        MessageContent::Text(content) => Ok(KuratchiMessage {
+            role: message.role,
+            content,
+        }),
+        MessageContent::Multimodal(_) => Err("Image attachments are not supported with Kuratchi AI sessions yet".to_string()),
+    }
+}
+
+async fn kuratchi_chat(
+    base_url: &str,
+    api_token: &str,
+    session_id: Option<String>,
+    model: Option<String>,
+    messages: Vec<AiMessage>,
+    timeout_secs: u64,
+) -> Result<KuratchiChatData, String> {
+    let body = KuratchiChatRequest {
+        session_id,
+        model,
+        messages: messages
+            .into_iter()
+            .map(message_to_kuratchi)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    let client = build_http_client(timeout_secs)?;
+    let resp = client
+        .post(build_kuratchi_url(base_url, "/ai/chat"))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Kuratchi request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Kuratchi API error {}: {}", status, text));
+    }
+
+    let parsed: KuratchiChatEnvelope = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Kuratchi response: {}", e))?;
+
+    if !parsed.success {
+        return Err(parsed.error.unwrap_or_else(|| "Kuratchi AI request failed".to_string()));
+    }
+
+    parsed
+        .data
+        .ok_or_else(|| "Kuratchi AI response was missing data".to_string())
+}
+
+async fn kuratchi_create_session(
+    base_url: &str,
+    api_token: &str,
+    title: Option<String>,
+    model: Option<String>,
+) -> Result<KuratchiSessionSummary, String> {
+    let client = build_http_client(30)?;
+    let resp = client
+        .post(build_kuratchi_url(base_url, "/ai/sessions"))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&CreateSessionRequest { title, model })
+        .send()
+        .await
+        .map_err(|e| format!("Create session request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Create session error {}: {}", status, text));
+    }
+
+    let parsed: CreateSessionEnvelope = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse create session response: {}", e))?;
+
+    if !parsed.success {
+        return Err(parsed.error.unwrap_or_else(|| "Create session failed".to_string()));
+    }
+
+    parsed
+        .data
+        .ok_or_else(|| "Create session response was missing data".to_string())
 }
 
 #[tauri::command]
 pub async fn ai_chat(
-    account_id: String,
+    base_url: String,
     api_token: String,
     prompt: String,
     cwd: Option<String>,
@@ -158,44 +317,16 @@ Rules:
         },
     ];
 
-    let body = AiRequest {
+    let result = kuratchi_chat(
+        &base_url,
+        &api_token,
+        None,
+        Some(DEFAULT_KURATCHI_MODEL.to_string()),
         messages,
-        max_tokens: 1024,
-    };
+        30,
+    ).await?;
 
-    let url = format!("{}@cf/meta/llama-4-scout-17b-16e-instruct", AI_API_BASE.replace("{}", &account_id));
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, text));
-    }
-
-    let ai_resp: AiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    if !ai_resp.success {
-        return Err(format!("AI API error: {:?}", ai_resp.errors));
-    }
-
-    ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No response from AI".to_string())
+    Ok(result.reply)
 }
 
 #[derive(Deserialize)]
@@ -206,7 +337,7 @@ pub struct CommandResult {
 
 #[tauri::command]
 pub async fn ai_summarize(
-    account_id: String,
+    base_url: String,
     api_token: String,
     original_prompt: String,
     command_results: Vec<CommandResult>,
@@ -245,44 +376,57 @@ Rules:
         },
     ];
 
-    let body = AiRequest {
+    let result = kuratchi_chat(
+        &base_url,
+        &api_token,
+        None,
+        Some(DEFAULT_KURATCHI_MODEL.to_string()),
         messages,
-        max_tokens: 2048,
-    };
+        30,
+    ).await?;
 
-    let url = format!("{}@cf/meta/llama-4-scout-17b-16e-instruct", AI_API_BASE.replace("{}", &account_id));
+    Ok(result.reply)
+}
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+#[tauri::command]
+pub async fn ai_list_sessions(
+    base_url: String,
+    api_token: String,
+) -> Result<Vec<KuratchiSessionSummary>, String> {
+    let client = build_http_client(30)?;
     let resp = client
-        .post(&url)
+        .get(build_kuratchi_url(&base_url, "/ai/sessions"))
         .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("List sessions request failed: {}", e))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, text));
+        return Err(format!("List sessions error {}: {}", status, text));
     }
 
-    let ai_resp: AiResponse = resp
+    let parsed: KuratchiSessionsEnvelope = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|e| format!("Failed to parse sessions response: {}", e))?;
 
-    if !ai_resp.success {
-        return Err(format!("AI API error: {:?}", ai_resp.errors));
+    if !parsed.success {
+        return Err(parsed.error.unwrap_or_else(|| "List sessions failed".to_string()));
     }
 
-    ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No response from AI".to_string())
+    Ok(parsed.data.unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn ai_create_session(
+    base_url: String,
+    api_token: String,
+    title: Option<String>,
+    model: Option<String>,
+) -> Result<KuratchiSessionSummary, String> {
+    kuratchi_create_session(&base_url, &api_token, title, model).await
 }
 
 fn build_tools_prompt(tools: &[(String, String, Vec<mcp::McpToolDef>)]) -> String {
@@ -353,16 +497,17 @@ pub struct ToolCallResult {
 
 #[tauri::command]
 pub async fn ai_chat_with_tools(
-    account_id: String,
+    base_url: String,
     api_token: String,
     model: String,
+    session_id: Option<String>,
     prompt: String,
     attachments: Vec<AiAttachment>,
     cwd: Option<String>,
     os_info: Option<String>,
     shell: Option<String>,
     ssh_target: Option<String>,
-) -> Result<String, String> {
+) -> Result<AiChatTurn, String> {
     let servers = mcp::load_mcp_config();
 
     let mut all_tools: Vec<(String, String, Vec<mcp::McpToolDef>)> = Vec::new();
@@ -425,7 +570,7 @@ CRITICAL RULES:
         String::new()
     };
 
-    let system_prompt = format!(
+    let _system_prompt = format!(
         r#"You are an expert terminal assistant in Drover. The user describes tasks in natural language and you respond with executable shell commands OR MCP tool calls.
 
 Rules:
@@ -436,295 +581,38 @@ Rules:
         context_block, tools_block, &tool_instructions
     );
 
-    // Multi-model pipeline: if images are present, first process with vision model
-    let has_images = attachments.iter().any(|a| a.mime_type.starts_with("image/"));
-    
-    println!("[AI] Attachments count: {}, has_images: {}", attachments.len(), has_images);
-    for att in &attachments {
-        println!("[AI] Attachment: name={}, mime_type={}, content_len={}", att.name, att.mime_type, att.content.len());
-    }
-    
-    let final_response = if has_images {
-        println!("[AI] Processing with vision model...");
-        // Step 1: Use vision model to analyze images
-        let vision_analysis = process_images_with_vision(
-            &account_id,
-            &api_token,
-            &prompt,
-            &attachments,
-        ).await?;
-        
-        // Prefix with ANSWER: so frontend treats it as a direct response, not shell commands
-        format!("ANSWER: {}", vision_analysis)
-    } else {
-        // No images - proceed with normal single-model processing
-        process_without_images(
-            &account_id,
-            &api_token,
-            &model,
-            &prompt,
-            &attachments,
-            &context_block,
-            &tools_block,
-            &tool_instructions,
-        ).await?
-    };
-    
-    Ok(final_response)
-}
-
-async fn process_images_with_vision(
-    account_id: &str,
-    api_token: &str,
-    prompt: &str,
-    attachments: &[AiAttachment],
-) -> Result<String, String> {
-    // Use Llama 3.2 Vision - it supports the image parameter in REST API
-    let vision_model = "@cf/meta/llama-3.2-11b-vision-instruct";
-    
-    try_vision_request(account_id, api_token, vision_model, prompt, attachments).await
-}
-
-async fn try_vision_request(
-    account_id: &str,
-    api_token: &str,
-    vision_model: &str,
-    prompt: &str,
-    attachments: &[AiAttachment],
-) -> Result<String, String> {
-    // Find the first image attachment and create data URL
-    let image_data_url = attachments
+    if attachments
         .iter()
-        .find(|a| a.mime_type.starts_with("image/"))
-        .map(|a| format!("data:{};base64,{}", a.mime_type, a.content));
-    
-    // Build multimodal content array with image first, then text
-    let mut content_parts = Vec::new();
-    
-    // Add image to content first
-    if let Some(ref data_url) = image_data_url {
-        content_parts.push(ContentPart::ImageUrl {
-            image_url: ImageUrlData { url: data_url.clone() },
-        });
+        .any(|attachment| attachment.mime_type.starts_with("image/"))
+    {
+        return Err("Kuratchi AI sessions do not support image attachments yet".to_string());
     }
-    
-    // Then add the user's request
-    content_parts.push(ContentPart::Text { 
-        text: prompt.to_string()
-    });
-    
-    // Use multimodal message format - image embedded in content array
-    let messages = vec![
-        AiMessage {
-            role: "system".to_string(),
-            content: MessageContent::Text("You are a vision AI that CAN see and analyze images. An image is attached to this message. NEVER say you cannot see images or that you need text input - you can see the image directly. Analyze what you see and respond to the user's request. Be direct and helpful.".to_string()),
-        },
-        AiMessage {
-            role: "user".to_string(),
-            content: MessageContent::Multimodal(content_parts),
-        },
-    ];
-    
-    // Use regular AiRequest - image is embedded in message content, not separate field
-    let body = AiRequest {
-        messages,
-        max_tokens: 2048,
-    };
-    
-    println!("[Vision] Image data URL present: {}, length: {}", image_data_url.is_some(), image_data_url.as_ref().map(|s| s.len()).unwrap_or(0));
-    
-    let url = format!("{}{}", AI_API_BASE.replace("{}", account_id), vision_model);
-    println!("[Vision] URL: {}", url);
-    
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-    
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Vision model request failed: {}", e))?;
-    
-    println!("[Vision] Response status: {}", resp.status());
-    
-    // Handle license agreement requirement (403 with code 5016)
-    if resp.status() == reqwest::StatusCode::FORBIDDEN {
-        let text = resp.text().await.unwrap_or_default();
-        if text.contains("Model Agreement") || text.contains("code\":5016") {
-            println!("[Vision] License agreement required, sending 'agree' prompt...");
-            
-            // Send agreement request using simple prompt format
-            let agree_body = serde_json::json!({
-                "prompt": "agree"
-            });
-            
-            let agree_resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_token))
-                .json(&agree_body)
-                .send()
-                .await
-                .map_err(|e| format!("Agreement request failed: {}", e))?;
-            
-            let agree_status = agree_resp.status();
-            let agree_text = agree_resp.text().await.unwrap_or_default();
-            println!("[Vision] Agreement response status: {}, body: {}", agree_status, &agree_text[..agree_text.len().min(200)]);
-            
-            // Check if agreement was accepted - the API returns 403 but with "Thank you for agreeing" message
-            let agreement_accepted = agree_text.contains("Thank you for agreeing") || agree_status.is_success();
-            
-            if !agreement_accepted {
-                return Err(format!("Failed to accept license agreement: {}", agree_text));
-            }
-            
-            println!("[Vision] License agreement accepted!");
-            
-            // Now retry the original vision request
-            println!("[Vision] Agreement accepted, retrying vision request...");
-            let retry_resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_token))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("Vision retry request failed: {}", e))?;
-            
-            println!("[Vision] Retry response status: {}", retry_resp.status());
-            
-            if !retry_resp.status().is_success() {
-                let retry_text = retry_resp.text().await.unwrap_or_default();
-                return Err(format!("Vision model error after agreement: {}", retry_text));
-            }
-            
-            let retry_text = retry_resp.text().await.map_err(|e| format!("Failed to read retry response: {}", e))?;
-            println!("[Vision] Retry response (first 500 chars): {}", &retry_text[..retry_text.len().min(500)]);
-            
-            let ai_resp: AiResponse = serde_json::from_str(&retry_text)
-                .map_err(|e| format!("Failed to parse vision response: {}", e))?;
-            
-            if !ai_resp.success {
-                return Err(format!("Vision API failed: {:?}", ai_resp.errors));
-            }
-            
-            return ai_resp
-                .result
-                .and_then(|r| r.response)
-                .ok_or_else(|| "No vision response".to_string());
-        }
-        
-        println!("[Vision] Error response: {}", text);
-        return Err(format!("Vision model error 403: {}", text));
-    }
-    
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        println!("[Vision] Error response: {}", text);
-        return Err(format!("Vision model error {}: {}", status, text));
-    }
-    
-    let resp_text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
-    println!("[Vision] Response text (first 500 chars): {}", &resp_text[..resp_text.len().min(500)]);
-    
-    let ai_resp: AiResponse = serde_json::from_str(&resp_text)
-        .map_err(|e| format!("Failed to parse vision response: {}", e))?;
-    
-    if !ai_resp.success {
-        return Err(format!("Vision API failed: {:?}", ai_resp.errors));
-    }
-    
-    ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No vision response".to_string())
-}
 
-async fn synthesize_with_selected_model(
-    account_id: &str,
-    api_token: &str,
-    model: &str,
-    synthesis_prompt: &str,
-    context_block: &str,
-    tools_block: &str,
-    tool_instructions: &str,
-) -> Result<String, String> {
-    let system_prompt = format!(
-        r#"You are an expert terminal assistant in Drover. The user describes tasks in natural language and you respond with executable shell commands OR MCP tool calls.
-
-Rules:
-- Respond with ONLY executable shell commands (one per line) or TOOL_CALL directives.
-- No explanations, no markdown, no code fences, no commentary.
-- ALWAYS single-quote URLs that contain special shell characters (?, &, =, #, etc.). For example: curl 'https://wttr.in/Houston?format=j1'
-- If a task is dangerous, respond with: ERROR: <reason>{}{}{}"#,
-        context_block, tools_block, tool_instructions
-    );
-    
-    let messages = vec![
-        AiMessage {
-            role: "system".to_string(),
-            content: MessageContent::Text(system_prompt),
-        },
-        AiMessage {
-            role: "user".to_string(),
-            content: MessageContent::Text(synthesis_prompt.to_string()),
-        },
-    ];
-    
-    let body = AiRequest {
-        messages,
-        max_tokens: 2048,
-    };
-    
-    let url = format!("{}{}", AI_API_BASE.replace("{}", account_id), model);
-    
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-    
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Synthesis request failed: {}", e))?;
-    
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Synthesis error {}: {}", status, text));
-    }
-    
-    let ai_resp: AiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse synthesis response: {}", e))?;
-    
-    if !ai_resp.success {
-        return Err(format!("Synthesis API failed: {:?}", ai_resp.errors));
-    }
-    
-    ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No synthesis response".to_string())
+    process_without_images(
+        &base_url,
+        &api_token,
+        &model,
+        session_id,
+        &prompt,
+        &attachments,
+        &context_block,
+        &tools_block,
+        &tool_instructions,
+    )
+    .await
 }
 
 async fn process_without_images(
-    account_id: &str,
+    base_url: &str,
     api_token: &str,
     model: &str,
+    session_id: Option<String>,
     prompt: &str,
     attachments: &[AiAttachment],
     context_block: &str,
     tools_block: &str,
     tool_instructions: &str,
-) -> Result<String, String> {
+) -> Result<AiChatTurn, String> {
     // Check if this is an explanation/analysis request (not a task to execute)
     let prompt_lower = prompt.to_lowercase();
     let is_explanation_request = prompt_lower.contains("explain") 
@@ -739,7 +627,7 @@ async fn process_without_images(
     
     // If asking for explanation with text file attachments, use explanation mode
     if is_explanation_request && has_text_attachments {
-        return process_explanation_request(account_id, api_token, model, prompt, attachments).await;
+        return process_explanation_request(base_url, api_token, model, session_id, prompt, attachments).await;
     }
     
     let system_prompt = format!(
@@ -781,54 +669,30 @@ Rules:
         user_message,
     ];
 
-    let body = AiRequest {
+    let result = kuratchi_chat(
+        base_url,
+        api_token,
+        session_id,
+        Some(model.to_string()),
         messages,
-        max_tokens: 2048,
-    };
+        60,
+    )
+    .await?;
 
-    let url = format!("{}{}", AI_API_BASE.replace("{}", account_id), model);
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("AI request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("AI error {}: {}", status, text));
-    }
-
-    let ai_resp: AiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse AI response: {}", e))?;
-
-    if !ai_resp.success {
-        return Err(format!("AI API failed: {:?}", ai_resp.errors));
-    }
-
-    let result = ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No AI response".to_string())?;
-    Ok(result)
+    Ok(AiChatTurn {
+        session_id: result.session_id,
+        response: result.reply,
+    })
 }
 
 async fn process_explanation_request(
-    account_id: &str,
+    base_url: &str,
     api_token: &str,
     model: &str,
+    session_id: Option<String>,
     prompt: &str,
     attachments: &[AiAttachment],
-) -> Result<String, String> {
+) -> Result<AiChatTurn, String> {
     println!("[AI] Processing explanation request for text file attachments...");
     
     // Build content with attached files
@@ -853,48 +717,21 @@ async fn process_explanation_request(
         },
     ];
 
-    let body = AiRequest {
+    let result = kuratchi_chat(
+        base_url,
+        api_token,
+        session_id,
+        Some(model.to_string()),
         messages,
-        max_tokens: 2048,
-    };
-
-    let url = format!("{}{}", AI_API_BASE.replace("{}", account_id), model);
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("AI request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("AI error {}: {}", status, text));
-    }
-
-    let ai_resp: AiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse AI response: {}", e))?;
-
-    if !ai_resp.success {
-        return Err(format!("AI API failed: {:?}", ai_resp.errors));
-    }
-
-    let explanation = ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No AI response".to_string())?;
+        60,
+    )
+    .await?;
     
     // Return with ANSWER: prefix so frontend displays it directly
-    Ok(format!("ANSWER: {}", explanation))
+    Ok(AiChatTurn {
+        session_id: result.session_id,
+        response: format!("ANSWER: {}", result.reply),
+    })
 }
 
 #[derive(Deserialize)]
@@ -905,7 +742,7 @@ pub struct FailedAttempt {
 
 #[tauri::command]
 pub async fn ai_retry(
-    account_id: String,
+    base_url: String,
     api_token: String,
     original_prompt: String,
     failed_attempts: Vec<FailedAttempt>,
@@ -974,49 +811,23 @@ Rules:
         },
     ];
 
-    let body = AiRequest {
-        messages,
-        max_tokens: 2048,
-    };
-
-    let url = format!("{}@cf/meta/llama-4-scout-17b-16e-instruct", AI_API_BASE.replace("{}", &account_id));
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("AI retry request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("AI error {}: {}", status, text));
-    }
-
-    let ai_resp: AiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse AI response: {}", e))?;
-
-    if !ai_resp.success {
-        return Err(format!("AI API failed: {:?}", ai_resp.errors));
-    }
-
-    ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No AI response".to_string())
+    Ok(
+        kuratchi_chat(
+            &base_url,
+            &api_token,
+            None,
+            Some(DEFAULT_KURATCHI_MODEL.to_string()),
+            messages,
+            60,
+        )
+        .await?
+        .reply,
+    )
 }
 
 #[tauri::command]
 pub async fn ai_summarize_tool_results(
-    account_id: String,
+    base_url: String,
     api_token: String,
     original_prompt: String,
     tool_results: Vec<ToolCallResult>,
@@ -1068,49 +879,23 @@ Rules:
         },
     ];
 
-    let body = AiRequest {
-        messages,
-        max_tokens: 4096,
-    };
-
-    let url = format!("{}@cf/meta/llama-4-scout-17b-16e-instruct", AI_API_BASE.replace("{}", &account_id));
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Summarize request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Summarize error {}: {}", status, text));
-    }
-
-    let ai_resp: AiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse summarize response: {}", e))?;
-
-    if !ai_resp.success {
-        return Err(format!("Summarize failed: {:?}", ai_resp.errors));
-    }
-
-    ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No summarize response".to_string())
+    Ok(
+        kuratchi_chat(
+            &base_url,
+            &api_token,
+            None,
+            Some(DEFAULT_KURATCHI_MODEL.to_string()),
+            messages,
+            30,
+        )
+        .await?
+        .reply,
+    )
 }
 
 #[tauri::command]
 pub async fn ai_edit_code(
-    account_id: String,
+    base_url: String,
     api_token: String,
     model: String,
     file_name: String,
@@ -1151,45 +936,16 @@ Rules:
         },
     ];
 
-    let body = AiRequest {
+    let modified = kuratchi_chat(
+        &base_url,
+        &api_token,
+        None,
+        Some(model),
         messages,
-        max_tokens: 4096,
-    };
-
-    let url = format!("{}{}", AI_API_BASE.replace("{}", &account_id), model);
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Code edit request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Code edit error {}: {}", status, text));
-    }
-
-    let ai_resp: AiResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse code edit response: {}", e))?;
-
-    if !ai_resp.success {
-        return Err(format!("Code edit failed: {:?}", ai_resp.errors));
-    }
-
-    let modified = ai_resp
-        .result
-        .and_then(|r| r.response)
-        .ok_or_else(|| "No code edit response".to_string())?;
+        60,
+    )
+    .await?
+    .reply;
 
     // Generate diff
     let diff_lines = generate_diff(&file_content, &modified);
@@ -1249,7 +1005,7 @@ fn generate_diff(original: &str, modified: &str) -> Vec<DiffLine> {
 
 #[tauri::command]
 pub async fn ai_edit_code_from_path(
-    account_id: String,
+    base_url: String,
     api_token: String,
     model: String,
     file_path: String,
@@ -1298,7 +1054,7 @@ pub async fn ai_edit_code_from_path(
     
     // Delegate to the existing ai_edit_code function
     ai_edit_code(
-        account_id,
+        base_url,
         api_token,
         model,
         file_name,
