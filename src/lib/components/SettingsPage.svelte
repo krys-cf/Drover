@@ -5,6 +5,7 @@
   interface SshSession { id: string; nickname: string; command: string; }
   interface SavedCommand { id: string; name: string; command: string; category: 'ssh' | 'quick'; }
   interface McpServerEntry { name: string; server_url: string; auth_token?: string; auth_command?: string; }
+  interface AiProvider { id: string; name: string; type: string; baseUrl: string; requiresKey: boolean; }
 
   let {
     aiAccountId = $bindable(''),
@@ -15,10 +16,14 @@
     sshSessions = [],
     savedCommands = [],
     mcpServers = [],
+    providerApiKeys = {},
+    aiProviders = [],
     onSaveSettings,
     onRevokeCredentials,
     onSaveGeminiKey,
     onRevokeGeminiKey,
+    onSaveProviderKey,
+    onRevokeProviderKey,
     onSaveTheme,
     onAddSshSession,
     onRemoveSshSession,
@@ -35,10 +40,14 @@
     sshSessions: SshSession[];
     savedCommands: SavedCommand[];
     mcpServers: McpServerEntry[];
+    providerApiKeys: Record<string, string>;
+    aiProviders: AiProvider[];
     onSaveSettings: (baseUrl: string, apiToken: string) => Promise<void>;
     onRevokeCredentials: () => Promise<void>;
     onSaveGeminiKey: (apiKey: string) => Promise<void>;
     onRevokeGeminiKey: () => Promise<void>;
+    onSaveProviderKey: (providerId: string, apiKey: string) => Promise<void>;
+    onRevokeProviderKey: (providerId: string) => Promise<void>;
     onSaveTheme: () => Promise<void>;
     onAddSshSession: (nickname: string, command: string) => void;
     onRemoveSshSession: (id: string) => void;
@@ -67,11 +76,24 @@
   let settingsSaved = $state(false);
   let geminiSaved = $state(false);
 
+  // OpenAI-compatible provider key editing state
+  let providerKeyEdits: Record<string, string> = $state({});
+  let providerKeyShow: Record<string, boolean> = $state({});
+  let providerKeySaved: Record<string, boolean> = $state({});
+
+  const openaiProviders = $derived(aiProviders.filter(p => p.type === 'openai' && p.requiresKey));
+
   // Sync when props change
   $effect(() => {
     settingsAccountId = aiAccountId;
     settingsApiToken = aiApiToken;
     settingsGeminiKey = geminiApiKey;
+    // Sync provider key edits from props
+    for (const p of openaiProviders) {
+      if (!(p.id in providerKeyEdits)) {
+        providerKeyEdits[p.id] = providerApiKeys[p.id] || '';
+      }
+    }
   });
 
   async function handleSave() {
@@ -97,6 +119,23 @@
     await onRevokeGeminiKey();
     settingsGeminiKey = '';
     showGeminiToken = false;
+  }
+
+  async function handleSaveProviderKey(providerId: string) {
+    const key = (providerKeyEdits[providerId] || '').trim();
+    if (!key) return;
+    await onSaveProviderKey(providerId, key);
+    providerKeySaved[providerId] = true;
+    providerKeySaved = { ...providerKeySaved };
+    setTimeout(() => { providerKeySaved[providerId] = false; providerKeySaved = { ...providerKeySaved }; }, 2000);
+  }
+
+  async function handleRevokeProviderKey(providerId: string) {
+    await onRevokeProviderKey(providerId);
+    providerKeyEdits[providerId] = '';
+    providerKeyShow[providerId] = false;
+    providerKeyEdits = { ...providerKeyEdits };
+    providerKeyShow = { ...providerKeyShow };
   }
 
   function selectTheme(id: string) {
@@ -279,6 +318,66 @@
           {/if}
         </div>
       </section>
+
+      {#each openaiProviders as prov (prov.id)}
+        <section class="settings-section" style="margin-top: 24px;">
+          <h2 class="settings-section-title">{prov.name}</h2>
+          <p class="settings-section-desc">Use {prov.name} models via its OpenAI-compatible API. Provide your API key below.</p>
+
+          <div class="settings-field">
+            <label class="settings-label" for="provider-key-{prov.id}">API Key</label>
+            <div class="settings-input-group">
+              <input
+                id="provider-key-{prov.id}"
+                class="settings-input"
+                type={providerKeyShow[prov.id] ? 'text' : 'password'}
+                bind:value={providerKeyEdits[prov.id]}
+                placeholder="sk-..."
+                spellcheck="false"
+              />
+              <button class="settings-reveal-btn" onclick={() => { providerKeyShow[prov.id] = !providerKeyShow[prov.id]; providerKeyShow = { ...providerKeyShow }; }} title={providerKeyShow[prov.id] ? 'Hide key' : 'Show key'}>
+                {providerKeyShow[prov.id] ? 'Hide' : 'Show'}
+              </button>
+            </div>
+            <span class="settings-hint">Your {prov.name} API key &mdash; base URL: {prov.baseUrl}</span>
+          </div>
+
+          {#if providerApiKeys[prov.id]}
+            <div class="settings-status settings-status-active">
+              <span class="settings-status-dot active"></span>
+              <span>{prov.name} API configured</span>
+            </div>
+          {:else}
+            <div class="settings-status settings-status-inactive">
+              <span class="settings-status-dot"></span>
+              <span>No key &mdash; {prov.name} models disabled in model selector</span>
+            </div>
+          {/if}
+
+          <div class="settings-actions">
+            <button class="settings-btn-save" onclick={() => handleSaveProviderKey(prov.id)} disabled={!(providerKeyEdits[prov.id] || '').trim()}>
+              {providerKeySaved[prov.id] ? 'Saved' : 'Save Key'}
+            </button>
+            {#if providerApiKeys[prov.id]}
+              <button class="settings-btn-revoke" onclick={() => handleRevokeProviderKey(prov.id)}>
+                Clear Key
+              </button>
+            {/if}
+          </div>
+        </section>
+      {/each}
+
+      <!-- Local providers (no key needed) -->
+      {#each aiProviders.filter(p => p.type === 'openai' && !p.requiresKey) as prov (prov.id)}
+        <section class="settings-section" style="margin-top: 24px;">
+          <h2 class="settings-section-title">{prov.name}</h2>
+          <p class="settings-section-desc">{prov.name} runs locally and doesn't need an API key. Make sure it's running at <code style="color:var(--accent-primary)">{prov.baseUrl}</code>.</p>
+          <div class="settings-status settings-status-active">
+            <span class="settings-status-dot active"></span>
+            <span>No key required &mdash; select a {prov.name} model in the model picker</span>
+          </div>
+        </section>
+      {/each}
 
     {:else if settingsTab === 'theme'}
       <section class="settings-section">

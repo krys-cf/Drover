@@ -244,6 +244,372 @@ async fn kuratchi_create_session(
         .ok_or_else(|| "Create session response was missing data".to_string())
 }
 
+// ── OpenAI-compatible API (covers OpenAI, Groq, OpenRouter, Ollama, etc.) ────
+
+#[derive(Serialize)]
+struct OpenAiRequest {
+    model: String,
+    messages: Vec<OpenAiMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OpenAiMessage {
+    role: String,
+    content: OpenAiContent,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum OpenAiContent {
+    Text(String),
+    Parts(Vec<OpenAiContentPart>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum OpenAiContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: OpenAiImageUrl },
+}
+
+#[derive(Serialize, Deserialize)]
+struct OpenAiImageUrl {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAiResponse {
+    choices: Option<Vec<OpenAiChoice>>,
+    error: Option<OpenAiError>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiChoiceMessage,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoiceMessage {
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiError {
+    message: String,
+}
+
+async fn openai_compatible_chat(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: Vec<OpenAiMessage>,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let url = format!(
+        "{}/chat/completions",
+        base_url.trim_end_matches('/')
+    );
+
+    let body = OpenAiRequest {
+        model: model.to_string(),
+        messages,
+        max_tokens: Some(4096),
+    };
+
+    let client = build_http_client(timeout_secs)?;
+    let mut req = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body);
+
+    // Only add auth header if api_key is non-empty (Ollama/LM Studio don't need one)
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI-compatible request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, text));
+    }
+
+    let parsed: OpenAiResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    if let Some(error) = parsed.error {
+        return Err(format!("API error: {}", error.message));
+    }
+
+    parsed
+        .choices
+        .and_then(|c| c.into_iter().next())
+        .and_then(|c| c.message.content)
+        .ok_or_else(|| "API returned no content".to_string())
+}
+
+#[tauri::command]
+pub async fn ai_openai_chat(
+    base_url: String,
+    api_key: String,
+    model: String,
+    prompt: String,
+    attachments: Vec<AiAttachment>,
+    cwd: Option<String>,
+    os_info: Option<String>,
+    shell: Option<String>,
+    ssh_target: Option<String>,
+) -> Result<String, String> {
+    // Load MCP tools
+    let servers = mcp::load_mcp_config();
+    let mut all_tools: Vec<(String, String, Vec<mcp::McpToolDef>)> = Vec::new();
+    for server in &servers {
+        if mcp::read_auth_token(server).is_none() {
+            continue;
+        }
+        match mcp::mcp_list_tools(server.server_url.clone(), server.name.clone()).await {
+            Ok(tools) => {
+                all_tools.push((server.name.clone(), server.server_url.clone(), tools));
+            }
+            Err(e) => {
+                eprintln!("Failed to list tools from {}: {}", server.name, e);
+            }
+        }
+    }
+
+    let has_tools = all_tools.iter().any(|(_, _, t)| !t.is_empty());
+
+    let mut context_lines = Vec::new();
+    if let Some(ref c) = cwd {
+        context_lines.push(format!("Current directory: {}", c));
+    }
+    if let Some(ref o) = os_info {
+        context_lines.push(format!("OS: {}", o));
+    }
+    if let Some(ref s) = shell {
+        context_lines.push(format!("Shell: {}", s));
+    }
+    if let Some(ref t) = ssh_target {
+        context_lines.push(format!("Connected via SSH to: {}", t));
+    }
+
+    let context_block = if context_lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nCurrent environment:\n{}", context_lines.join("\n"))
+    };
+
+    let tools_block = if has_tools {
+        format!("\n\n{}", build_tools_prompt(&all_tools))
+    } else {
+        String::new()
+    };
+
+    let tool_instructions = if has_tools {
+        let example = build_tool_example(&all_tools);
+        format!(r#"
+
+To use an MCP tool, output a line starting with "TOOL_CALL:" in this exact format:
+TOOL_CALL: server_name | tool_name | {{"param": "value"}}
+{}
+CRITICAL RULES:
+- server_name MUST be the exact name in [brackets] above.
+- tool_name is the full tool name exactly as listed.
+- Arguments must be valid JSON.
+- Every MCP tool invocation MUST use TOOL_CALL: format.
+- Do NOT explain tool calls — just output them."#, example)
+    } else {
+        String::new()
+    };
+
+    // Check if explanation request
+    let prompt_lower = prompt.to_lowercase();
+    let is_explanation = prompt_lower.contains("explain")
+        || prompt_lower.contains("what does")
+        || prompt_lower.contains("how does")
+        || prompt_lower.contains("describe")
+        || prompt_lower.contains("analyze")
+        || prompt_lower.contains("review");
+
+    let has_text_attachments = attachments
+        .iter()
+        .any(|a| !a.mime_type.starts_with("image/") && a.mime_type != "application/pdf");
+
+    let system_prompt = if is_explanation && has_text_attachments {
+        "You are a helpful coding assistant. Explain code clearly and thoroughly. Describe what the code does, how it works, and any important patterns or concepts used. Be direct and informative.".to_string()
+    } else {
+        format!(
+            r#"You are an expert terminal assistant in Drover. The user describes tasks in natural language and you respond with executable shell commands OR MCP tool calls.
+
+Rules:
+- Respond with ONLY executable shell commands (one per line) or TOOL_CALL directives.
+- No explanations, no markdown, no code fences, no commentary.
+- ALWAYS single-quote URLs that contain special shell characters (?, &, =, #, etc.).
+- If a task is dangerous, respond with: ERROR: <reason>
+- If the question is conversational or doesn't need commands, respond with: ANSWER: <your response>{}{}{}"#,
+            context_block, tools_block, tool_instructions
+        )
+    };
+
+    // Build messages
+    let mut messages = vec![OpenAiMessage {
+        role: "system".to_string(),
+        content: OpenAiContent::Text(system_prompt),
+    }];
+
+    // Build user message — check for image attachments
+    let has_images = attachments.iter().any(|a| a.mime_type.starts_with("image/"));
+
+    if has_images {
+        let mut parts: Vec<OpenAiContentPart> = Vec::new();
+
+        let mut user_text = prompt.clone();
+        for attachment in &attachments {
+            if !attachment.mime_type.starts_with("image/") && attachment.mime_type != "application/pdf" {
+                user_text.push_str(&format!("\n\n--- {} ---\n{}", attachment.name, attachment.content));
+            }
+        }
+        parts.push(OpenAiContentPart::Text { text: user_text });
+
+        for attachment in &attachments {
+            if attachment.mime_type.starts_with("image/") {
+                parts.push(OpenAiContentPart::ImageUrl {
+                    image_url: OpenAiImageUrl {
+                        url: format!("data:{};base64,{}", attachment.mime_type, attachment.content),
+                    },
+                });
+            }
+        }
+
+        messages.push(OpenAiMessage {
+            role: "user".to_string(),
+            content: OpenAiContent::Parts(parts),
+        });
+    } else {
+        let mut user_text = prompt.clone();
+        for attachment in &attachments {
+            if !attachment.mime_type.starts_with("image/") && attachment.mime_type != "application/pdf" {
+                user_text.push_str(&format!("\n\n--- {} ---\n{}", attachment.name, attachment.content));
+            }
+        }
+        messages.push(OpenAiMessage {
+            role: "user".to_string(),
+            content: OpenAiContent::Text(user_text),
+        });
+    }
+
+    let reply = openai_compatible_chat(&base_url, &api_key, &model, messages, 60).await?;
+
+    if is_explanation && has_text_attachments && !reply.starts_with("ANSWER:") {
+        Ok(format!("ANSWER: {}", reply))
+    } else {
+        Ok(reply)
+    }
+}
+
+#[tauri::command]
+pub async fn ai_openai_edit_code(
+    base_url: String,
+    api_key: String,
+    model: String,
+    file_name: String,
+    file_path: Option<String>,
+    file_content: String,
+    instruction: String,
+) -> Result<CodeEditResult, String> {
+    let messages = vec![
+        OpenAiMessage {
+            role: "system".to_string(),
+            content: OpenAiContent::Text(r#"You are an expert code editor. The user will provide a code file and an instruction for how to modify it.
+
+Your task:
+1. Analyze the existing code
+2. Make the requested modifications
+3. Return ONLY the complete modified file content
+
+Rules:
+- Return the ENTIRE modified file, not just the changed parts
+- Preserve the original code style, indentation, and formatting
+- Do not add explanatory comments unless specifically requested
+- Do not wrap the code in markdown code fences
+- Output ONLY the modified code, nothing else"#.to_string()),
+        },
+        OpenAiMessage {
+            role: "user".to_string(),
+            content: OpenAiContent::Text(format!(
+                "File: {}\n\nOriginal code:\n{}\n\nInstruction: {}",
+                file_name, file_content, instruction
+            )),
+        },
+    ];
+
+    let modified = openai_compatible_chat(&base_url, &api_key, &model, messages, 60).await?;
+
+    let diff_lines = generate_diff(&file_content, &modified);
+    let summary = generate_edit_summary(&file_content, &modified, &instruction);
+
+    Ok(CodeEditResult {
+        file_name,
+        file_path,
+        original: file_content,
+        modified,
+        diff_lines,
+        summary,
+    })
+}
+
+#[tauri::command]
+pub async fn ai_openai_edit_code_from_path(
+    base_url: String,
+    api_key: String,
+    model: String,
+    file_path: String,
+    instruction: String,
+    cwd: Option<String>,
+) -> Result<CodeEditResult, String> {
+    use std::path::PathBuf;
+
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+
+    let expand_tilde = |p: &str| -> String {
+        if p.starts_with('~') { p.replacen('~', &home, 1) } else { p.to_string() }
+    };
+
+    let resolved_path = if file_path.starts_with('/') || file_path.contains(':') {
+        file_path.clone()
+    } else if file_path.starts_with('~') {
+        expand_tilde(&file_path)
+    } else if let Some(ref cwd) = cwd {
+        let mut path = PathBuf::from(expand_tilde(cwd));
+        path.push(&file_path);
+        path.to_string_lossy().to_string()
+    } else {
+        file_path.clone()
+    };
+
+    let file_content = std::fs::read_to_string(&resolved_path)
+        .map_err(|e| format!("Failed to read file '{}': {}", resolved_path, e))?;
+
+    let file_name = PathBuf::from(&resolved_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.clone());
+
+    ai_openai_edit_code(base_url, api_key, model, file_name, Some(resolved_path), file_content, instruction).await
+}
+
 // ── Gemini API types ──────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -251,6 +617,15 @@ struct GeminiRequest {
     contents: Vec<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<GeminiSystemInstruction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GeminiGenerationConfig>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_modalities: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -296,6 +671,13 @@ struct GeminiCandidateContent {
 #[derive(Deserialize)]
 struct GeminiResponsePart {
     text: Option<String>,
+    inline_data: Option<GeminiResponseInlineData>,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponseInlineData {
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -321,6 +703,7 @@ async fn gemini_chat(
                 }],
             })
         },
+        generation_config: None,
     };
 
     let url = format!(
@@ -604,6 +987,92 @@ pub async fn ai_gemini_edit_code_from_path(
     ai_gemini_edit_code(api_key, model, file_name, Some(resolved_path), file_content, instruction).await
 }
 
+// ── Gemini image generation (Nano Banana 2) ───────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ImageGenerationResult {
+    pub image_data: String,  // base64-encoded image
+    pub mime_type: String,
+    pub text: String,        // any accompanying text from the model
+}
+
+#[tauri::command]
+pub async fn ai_gemini_generate_image(
+    api_key: String,
+    model: String,
+    prompt: String,
+) -> Result<ImageGenerationResult, String> {
+    let body = GeminiRequest {
+        contents: vec![GeminiContent {
+            role: "user".to_string(),
+            parts: vec![GeminiPart::Text { text: prompt }],
+        }],
+        system_instruction: None,
+        generation_config: Some(GeminiGenerationConfig {
+            response_modalities: Some(vec!["TEXT".to_string(), "IMAGE".to_string()]),
+        }),
+    };
+
+    let url = format!(
+        "{}/models/{}:generateContent?key={}",
+        GEMINI_API_BASE, model, api_key
+    );
+
+    let client = build_http_client(120)?;
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Gemini image request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Gemini API error {}: {}", status, text));
+    }
+
+    let parsed: GeminiResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Gemini response: {}", e))?;
+
+    if let Some(error) = parsed.error {
+        return Err(format!("Gemini error: {}", error.message));
+    }
+
+    let parts = parsed
+        .candidates
+        .and_then(|c| c.into_iter().next())
+        .map(|c| c.content.parts)
+        .ok_or_else(|| "Gemini returned no content".to_string())?;
+
+    let mut image_data = String::new();
+    let mut mime_type = String::from("image/png");
+    let mut text_parts = Vec::new();
+
+    for part in parts {
+        if let Some(inline) = part.inline_data {
+            image_data = inline.data;
+            mime_type = inline.mime_type;
+        }
+        if let Some(t) = part.text {
+            text_parts.push(t);
+        }
+    }
+
+    if image_data.is_empty() {
+        return Err("Gemini did not return an image. Try rephrasing your prompt.".to_string());
+    }
+
+    Ok(ImageGenerationResult {
+        image_data,
+        mime_type,
+        text: text_parts.join("\n"),
+    })
+}
+
 #[tauri::command]
 pub async fn ai_chat(
     base_url: String,
@@ -750,6 +1219,40 @@ Rules:
 }
 
 #[tauri::command]
+pub async fn ai_generate_session_title(
+    base_url: String,
+    api_token: String,
+    prompt: String,
+    model: Option<String>,
+) -> Result<String, String> {
+    let messages = vec![
+        AiMessage {
+            role: "system".to_string(),
+            content: MessageContent::Text(
+                "Generate a short descriptive chat title for a developer's request. Return only the title, with no quotes, no markdown, and no punctuation unless required. Keep it under 6 words."
+                    .to_string(),
+            ),
+        },
+        AiMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(prompt),
+        },
+    ];
+
+    let result = kuratchi_chat(
+        &base_url,
+        &api_token,
+        None,
+        model.or(Some(DEFAULT_KURATCHI_MODEL.to_string())),
+        messages,
+        20,
+    )
+    .await?;
+
+    Ok(result.reply.trim().trim_matches('"').to_string())
+}
+
+#[tauri::command]
 pub async fn ai_list_sessions(
     base_url: String,
     api_token: String,
@@ -788,6 +1291,29 @@ pub async fn ai_create_session(
     model: Option<String>,
 ) -> Result<KuratchiSessionSummary, String> {
     kuratchi_create_session(&base_url, &api_token, title, model).await
+}
+
+#[tauri::command]
+pub async fn ai_delete_session(
+    base_url: String,
+    api_token: String,
+    session_id: String,
+) -> Result<(), String> {
+    let client = build_http_client(30)?;
+    let resp = client
+        .delete(build_kuratchi_url(&base_url, &format!("/ai/sessions/{}", session_id)))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Delete session request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Delete session error {}: {}", status, text));
+    }
+
+    Ok(())
 }
 
 fn build_tools_prompt(tools: &[(String, String, Vec<mcp::McpToolDef>)]) -> String {

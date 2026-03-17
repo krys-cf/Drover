@@ -64,6 +64,7 @@ pub fn run() {
             shell::get_shell_cwd,
             ai::ai_chat,
             ai::ai_summarize,
+            ai::ai_generate_session_title,
             files::list_directory,
             files::read_file_contents,
             files::write_file_contents,
@@ -99,13 +100,18 @@ pub fn run() {
             ai::ai_chat_with_tools,
             ai::ai_list_sessions,
             ai::ai_create_session,
+            ai::ai_delete_session,
             ai::ai_summarize_tool_results,
             ai::ai_retry,
             ai::ai_edit_code,
             ai::ai_edit_code_from_path,
             ai::ai_gemini_chat,
             ai::ai_gemini_edit_code,
-            ai::ai_gemini_edit_code_from_path
+            ai::ai_gemini_edit_code_from_path,
+            ai::ai_openai_chat,
+            ai::ai_openai_edit_code,
+            ai::ai_openai_edit_code_from_path,
+            ai::ai_gemini_generate_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
