@@ -13,11 +13,13 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@cloudflare/ai-chat": "^0.1.8",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-store": "^2.4.2",
     "@tauri-apps/plugin-stronghold": "^2.3.1",
-    "agents": "^0.7.6"
+    "agents": "^0.7.6",
+    "ai": "^6.0.116"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",

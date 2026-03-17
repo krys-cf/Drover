@@ -6,6 +6,8 @@
   import { Client, Stronghold } from '@tauri-apps/plugin-stronghold';
   import { appDataDir, homeDir as getHomeDir } from '@tauri-apps/api/path';
   import { AgentClient } from 'agents/client';
+  import type { UIMessage } from 'ai';
+  import { KuratchiAgentChat, type KuratchiChatStatus } from '$lib/kuratchi-agent-chat';
   import { TerminalEmulator, keyToSequence, encodeMouseEvent, type CellStyle } from '$lib/terminal-emulator';
   import { TerminalCanvas } from '$lib/terminal-canvas';
   import { THEMES, applyThemeCssVars, highlightPrompt as themeHighlightPrompt, isBarePrompt, highlightOutput, type TerminalTheme } from '$lib/theme';
@@ -96,6 +98,8 @@
     sessionId: string;
     title = $state('');
     customTitle = $state(false);
+    aiSessionId = $state('');
+    aiMessages = $state<LiveChatMessage[]>([]);
     emulator: TerminalEmulator;
     renderVersion = $state(0);
     connected = $state(true);
@@ -262,44 +266,38 @@
     session_id: string;
     response: string;
   }
-  interface LiveIdeState {
+  interface LiveAgentSnapshot {
     sessionId: string;
     organizationId: string;
     model: string;
-    phase: 'idle' | 'thinking' | 'approval' | 'executing' | 'answered' | 'needs_input' | 'error';
-    prompt: string;
-    raw: string;
-    response: string;
-    error: string;
-    commands: AiCmdEntry[];
+    createdAt: string;
+    updatedAt: string;
+    messages: UIMessage[];
   }
   interface LiveAgentConnectResponse {
     session: AiSessionSummary;
     agent: {
       agent: string;
       name: string;
+      basePath?: string;
       host: string;
       protocol: 'ws' | 'wss';
       query: Record<string, string>;
       expiresAt: string;
     };
   }
-  interface AiSessionDetailState {
-    sessionId: string;
-    organizationId: string;
-    model: string;
-    phase: 'idle' | 'thinking' | 'approval' | 'executing' | 'answered' | 'needs_input' | 'error';
-    prompt: string;
-    raw: string;
-    response: string;
-    error: string;
-    commands: AiCmdEntry[];
-  }
   interface AiSessionDetail extends AiSessionSummary {
-    state: AiSessionDetailState | null;
+    state: LiveAgentSnapshot | null;
   }
+  interface KuratchiModelsResponse {
+    defaultModel: string;
+    models: AiModelEntry[];
+  }
+  type LiveChatMessage = UIMessage;
+  type LiveChatPart = LiveChatMessage['parts'][number];
   let aiAttachments = $state<AiAttachment[]>([]);
   let aiModelDropdownOpen = $state(false);
+  let modelSearchQuery = $state('');
   let selectedAiModel = $state('@cf/meta/llama-4-scout-17b-16e-instruct');
   let aiSessions = $state<AiSessionSummary[]>([]);
   let aiSessionsSidebarOpen = $state(false);
@@ -307,11 +305,22 @@
   let aiSessionsLoading = $state(false);
   let aiSessionsError = $state('');
   let aiSessionActionError = $state('');
+  let deletingAiSessionId = $state('');
+  let aiSessionTitleOverrides = $state<Record<string, string>>({});
+  let editingAiSessionId = $state('');
+  let editingAiSessionTitle = $state('');
+  let cloudflareAiModels = $state<AiModelEntry[]>([]);
   let currentAiSessionId = $state('');
-  let liveAgentActiveBlockId = $state(0);
   let liveAgentConnecting = $state(false);
   let liveAgentSessionName = $state('');
-  let liveAgentClient: AgentClient<LiveIdeState> | null = null;
+  let liveAgentUrl = $state('');
+  let liveAgentClient: AgentClient<unknown> | null = null;
+  let liveAgentChat: KuratchiAgentChat<LiveChatMessage> | null = null;
+  let liveChatMessages = $state<LiveChatMessage[]>([]);
+  let liveInterruptDraft = $state<{ prompt: string; attachments: AiBlockAttachment[] } | null>(null);
+  let liveInterruptDialogOpen = $state(false);
+  let liveToolCallsInFlight = new Set<string>();
+  let liveToolCallsHandled = new Set<string>();
   
   // Code editing state
   interface DiffLine {
@@ -331,31 +340,112 @@
   let pendingCodeEdit = $state<CodeEditResult | null>(null);
   let applyingCodeEdit = $state(false);
   
-  type AiModelEntry = { id: string; name: string; description: string; provider: 'cloudflare' | 'gemini' };
-  const AI_MODELS: AiModelEntry[] = [
-    // Cloudflare (via Kuratchi)
-    { id: '@cf/meta/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout (17B)', description: 'Fast, efficient model', provider: 'cloudflare' },
-    { id: '@cf/meta/llama-3.1-8b-instruct', name: 'Llama 3.1 (8B)', description: 'Balanced performance', provider: 'cloudflare' },
-    { id: '@cf/meta/llama-3.1-70b-instruct', name: 'Llama 3.1 (70B)', description: 'High quality responses', provider: 'cloudflare' },
-    { id: '@cf/meta/llama-3.2-3b-instruct', name: 'Llama 3.2 (3B)', description: 'Lightweight and fast', provider: 'cloudflare' },
-    { id: '@cf/meta/llama-3.2-11b-vision-instruct', name: 'Llama 3.2 Vision (11B)', description: 'Vision + text understanding', provider: 'cloudflare' },
-    { id: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', name: 'Llama 3.3 (70B) Fast', description: 'Optimized for speed', provider: 'cloudflare' },
-    { id: '@cf/qwen/qwen2.5-14b-instruct', name: 'Qwen 2.5 (14B)', description: 'Strong reasoning', provider: 'cloudflare' },
-    { id: '@cf/qwen/qwen2.5-72b-instruct', name: 'Qwen 2.5 (72B)', description: 'Advanced reasoning', provider: 'cloudflare' },
-    { id: '@cf/deepseek-ai/deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 (70B)', description: 'Reasoning specialist', provider: 'cloudflare' },
-    // Google Gemini (direct API)
-    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', description: 'Fast + thinking', provider: 'gemini' },
-    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', description: 'Most capable', provider: 'gemini' },
-    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', description: 'Speed optimized', provider: 'gemini' },
-    { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite', description: 'Lightweight', provider: 'gemini' },
+  // Provider types: 'cloudflare' routes via Kuratchi, 'gemini' uses Google API, 'openai' uses OpenAI-compatible API
+  type ProviderType = 'cloudflare' | 'gemini' | 'openai';
+  interface AiProvider { id: string; name: string; type: ProviderType; baseUrl: string; requiresKey: boolean; }
+  type AiModelEntry = { id: string; name: string; description: string; provider: string };
+
+  const AI_PROVIDERS: AiProvider[] = [
+    { id: 'cloudflare', name: 'Cloudflare', type: 'cloudflare', baseUrl: '', requiresKey: true },
+    { id: 'gemini', name: 'Gemini', type: 'gemini', baseUrl: '', requiresKey: true },
+    { id: 'openai', name: 'OpenAI', type: 'openai', baseUrl: 'https://api.openai.com/v1', requiresKey: true },
+    { id: 'groq', name: 'Groq', type: 'openai', baseUrl: 'https://api.groq.com/openai/v1', requiresKey: true },
+    { id: 'openrouter', name: 'OpenRouter', type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', requiresKey: true },
+    { id: 'ollama', name: 'Ollama', type: 'openai', baseUrl: 'http://localhost:11434/v1', requiresKey: false },
+    { id: 'lmstudio', name: 'LM Studio', type: 'openai', baseUrl: 'http://localhost:1234/v1', requiresKey: false },
   ];
 
-  function getSelectedModelProvider(): 'cloudflare' | 'gemini' {
-    return AI_MODELS.find(m => m.id === selectedAiModel)?.provider || 'cloudflare';
+  // API keys for OpenAI-compatible providers, keyed by provider id
+  let providerApiKeys: Record<string, string> = $state({});
+
+  const FALLBACK_CLOUDFLARE_AI_MODELS: AiModelEntry[] = [
+    { id: '@cf/meta/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout (17B)', description: 'Fast, general-purpose instruction model', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', name: 'Llama 3.3 (70B) Fast', description: 'High quality responses with low latency', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.2-11b-vision-instruct', name: 'Llama 3.2 Vision (11B)', description: 'Vision-capable model for image and text understanding', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.2-3b-instruct', name: 'Llama 3.2 (3B)', description: 'Lightweight and fast for simple assistant tasks', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.1-70b-instruct', name: 'Llama 3.1 (70B)', description: 'Large general-purpose instruction model', provider: 'cloudflare' },
+    { id: '@cf/meta/llama-3.1-8b-instruct', name: 'Llama 3.1 (8B)', description: 'Balanced model for everyday chat and coding help', provider: 'cloudflare' },
+    { id: '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b', name: 'DeepSeek R1 Distill Qwen (32B)', description: 'Reasoning-focused model currently available on Workers AI', provider: 'cloudflare' },
+    { id: '@cf/qwen/qwq-32b', name: 'QwQ (32B)', description: 'Reasoning-oriented Qwen model', provider: 'cloudflare' },
+    { id: '@cf/qwen/qwen3-30b-a3b-fp8', name: 'Qwen 3 30B A3B', description: 'Strong reasoning and instruction following', provider: 'cloudflare' },
+  ];
+
+  const STATIC_AI_MODELS: AiModelEntry[] = [
+    // Google Gemini (direct API)
+    { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', description: 'Advanced reasoning + agentic', provider: 'gemini' },
+    { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', description: 'Frontier-class, low cost', provider: 'gemini' },
+    { id: 'gemini-3.1-flash-image-preview', name: 'Nano Banana 2', description: 'Image generation + editing', provider: 'gemini' },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', description: 'Stable reasoning model', provider: 'gemini' },
+    // OpenAI
+    { id: 'gpt-4o', name: 'GPT-4o', description: 'Flagship multimodal', provider: 'openai' },
+    { id: 'gpt-4o-mini', name: 'GPT-4o Mini', description: 'Fast and affordable', provider: 'openai' },
+    { id: 'o3-mini', name: 'o3 Mini', description: 'Reasoning model', provider: 'openai' },
+    // Groq
+    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B', description: 'Fast inference', provider: 'groq' },
+    { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B', description: 'Ultra-fast', provider: 'groq' },
+    { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B', description: 'MoE architecture', provider: 'groq' },
+    { id: 'deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 70B', description: 'Reasoning on Groq', provider: 'groq' },
+    // OpenRouter
+    { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', description: 'Via OpenRouter', provider: 'openrouter' },
+    { id: 'anthropic/claude-haiku-4', name: 'Claude Haiku 4', description: 'Via OpenRouter', provider: 'openrouter' },
+    { id: 'google/gemini-2.5-pro-preview', name: 'Gemini 2.5 Pro', description: 'Via OpenRouter', provider: 'openrouter' },
+    { id: 'meta-llama/llama-4-maverick', name: 'Llama 4 Maverick', description: 'Via OpenRouter', provider: 'openrouter' },
+    // Ollama (local)
+    { id: 'llama3.1', name: 'Llama 3.1', description: 'Local model', provider: 'ollama' },
+    { id: 'codellama', name: 'Code Llama', description: 'Code specialist', provider: 'ollama' },
+    { id: 'mistral', name: 'Mistral', description: 'Local model', provider: 'ollama' },
+    { id: 'deepseek-coder-v2', name: 'DeepSeek Coder v2', description: 'Local coding', provider: 'ollama' },
+    // LM Studio (local)
+    { id: 'lmstudio-default', name: 'Loaded Model', description: 'Currently loaded', provider: 'lmstudio' },
+  ];
+
+  cloudflareAiModels = [...FALLBACK_CLOUDFLARE_AI_MODELS];
+
+  function getAllAiModels(): AiModelEntry[] {
+    return [...cloudflareAiModels, ...STATIC_AI_MODELS];
   }
 
-  // Keep backward compat alias
-  const CLOUDFLARE_AI_MODELS = AI_MODELS.filter(m => m.provider === 'cloudflare');
+  function getProviderForModel(modelId: string): AiProvider | undefined {
+    const model = getAllAiModels().find(m => m.id === modelId);
+    if (!model) return AI_PROVIDERS.find(p => p.id === 'cloudflare');
+    return AI_PROVIDERS.find(p => p.id === model.provider);
+  }
+
+  function getSelectedModelProvider(): ProviderType {
+    return getProviderForModel(selectedAiModel)?.type || 'cloudflare';
+  }
+
+  const IMAGE_GENERATION_MODELS = new Set(['gemini-3.1-flash-image-preview']);
+  function isImageGenerationModel(modelId: string): boolean {
+    return IMAGE_GENERATION_MODELS.has(modelId);
+  }
+
+  function isProviderConfigured(providerId: string): boolean {
+    const provider = AI_PROVIDERS.find(p => p.id === providerId);
+    if (!provider) return false;
+    if (provider.id === 'cloudflare') return !!(aiAccountId && aiApiToken);
+    if (provider.id === 'gemini') return !!geminiApiKey;
+    if (!provider.requiresKey) return true; // Ollama, LM Studio
+    return !!providerApiKeys[provider.id];
+  }
+
+  function getProviderApiKey(providerId: string): string {
+    if (providerId === 'cloudflare') return aiApiToken;
+    if (providerId === 'gemini') return geminiApiKey;
+    return providerApiKeys[providerId] || '';
+  }
+
+  function getProviderBaseUrl(providerId: string): string {
+    return AI_PROVIDERS.find(p => p.id === providerId)?.baseUrl || '';
+  }
+
+  function isAnyProviderConfigured(): boolean {
+    return AI_PROVIDERS.some(p => isProviderConfigured(p.id));
+  }
+
+  function getCloudflareAiModels(): AiModelEntry[] {
+    return cloudflareAiModels;
+  }
 
   const ERROR_PATTERNS = [
     /is not recognized as the name of a cmdlet/i,
@@ -624,6 +714,8 @@
       // Load saved commands
       const savedCmds = await store.get<SavedCommand[]>('saved_commands');
       if (savedCmds) savedCommands = savedCmds;
+      const savedTitleOverrides = await store.get<Record<string, string>>('ai_session_title_overrides');
+      if (savedTitleOverrides) aiSessionTitleOverrides = savedTitleOverrides;
       // Load MCP servers from drover.json
       try {
         const servers: McpServerEntry[] = await invoke('mcp_list_servers');
@@ -643,7 +735,15 @@
     } catch (e) {
       console.error('Failed to load Gemini API key:', e);
     }
+    // Load OpenAI-compatible provider API keys
+    for (const p of AI_PROVIDERS.filter(p => p.type === 'openai' && p.requiresKey)) {
+      try {
+        const key = await strongholdGet(`provider_key_${p.id}`);
+        if (key) providerApiKeys[p.id] = key;
+      } catch { /* not yet stored */ }
+    }
     if (aiAccountId && aiApiToken) {
+      await refreshKuratchiModels();
       await refreshAiSessions();
     }
   }
@@ -1096,11 +1196,116 @@
     }
   }
 
+  async function refreshKuratchiModels() {
+    if (!aiAccountId || !aiApiToken) {
+      cloudflareAiModels = [...FALLBACK_CLOUDFLARE_AI_MODELS];
+      return;
+    }
+
+    try {
+      const payload = await kuratchiRequest<KuratchiModelsResponse>('/api/v1/ai/models');
+      cloudflareAiModels = Array.isArray(payload.models) ? payload.models : [];
+
+      if (payload.defaultModel && (!selectedAiModel || getProviderForModel(selectedAiModel)?.id === 'cloudflare')) {
+        const selectedStillExists = cloudflareAiModels.some((model) => model.id === selectedAiModel);
+        if (!selectedStillExists) {
+          selectedAiModel = payload.defaultModel;
+        }
+      }
+    } catch (e) {
+      console.error('Failed to load Kuratchi models:', e);
+      if (cloudflareAiModels.length === 0) {
+        cloudflareAiModels = [...FALLBACK_CLOUDFLARE_AI_MODELS];
+      }
+    }
+  }
+
+  function isAiPlaceholderTitle(title?: string | null): boolean {
+    if (!title) return false;
+    const normalized = title.trim().toLowerCase();
+    return normalized === 'original question' || normalized === 'origianl question';
+  }
+
+  function fallbackSessionTitle(prompt: string): string {
+    const cleaned = prompt
+      .replace(/\s+/g, ' ')
+      .replace(/[`"'[\]{}()]/g, '')
+      .trim();
+    if (!cleaned) return 'New session';
+    const words = cleaned.split(' ').slice(0, 6);
+    const title = words.join(' ').replace(/[.,:;!?]+$/g, '');
+    return title.length > 48 ? `${title.slice(0, 45).trimEnd()}...` : title;
+  }
+
+  function getAiSessionDisplayTitle(session: AiSessionSummary): string {
+    const override = aiSessionTitleOverrides[session.id]?.trim();
+    if (override) return override;
+    if (session.title && !isAiPlaceholderTitle(session.title)) return session.title;
+    if (session.lastUserMessage) return fallbackSessionTitle(session.lastUserMessage);
+    return 'New session';
+  }
+
+  function syncActiveAiStateFromTab(tab: Tab | undefined) {
+    currentAiSessionId = tab?.aiSessionId || '';
+    liveChatMessages = [...(tab?.aiMessages || [])];
+  }
+
+  function setTabAiState(tab: Tab | undefined, sessionId: string, messages: LiveChatMessage[] = []) {
+    if (!tab) return;
+    tab.aiSessionId = sessionId;
+    tab.aiMessages = [...messages];
+    liveToolCallsInFlight = new Set();
+    liveToolCallsHandled = new Set();
+    if (tab.id === activeTabId) {
+      currentAiSessionId = sessionId;
+      liveChatMessages = [...messages];
+    }
+  }
+
+  async function saveAiSessionTitleOverrides() {
+    try {
+      const store = await load('settings.json', { autoSave: true, defaults: {} });
+      await store.set('ai_session_title_overrides', JSON.parse(JSON.stringify(aiSessionTitleOverrides)));
+      await store.save();
+    } catch (e) {
+      console.error('Failed to save AI session title overrides:', e);
+    }
+  }
+
+  async function generateAiSessionTitle(prompt: string): Promise<string> {
+    const fallback = fallbackSessionTitle(prompt);
+    if (!aiAccountId || !aiApiToken || !prompt.trim()) return fallback;
+    try {
+      const generated = await invoke<string>('ai_generate_session_title', {
+        baseUrl: aiAccountId,
+        apiToken: aiApiToken,
+        prompt,
+        model: selectedAiModel,
+      });
+      const cleaned = generated.trim().replace(/^["']|["']$/g, '');
+      return cleaned || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  async function ensureSessionTitleForPrompt(sessionId: string, prompt: string) {
+    if (!sessionId || aiSessionTitleOverrides[sessionId]?.trim()) return;
+    const existingSession = aiSessions.find((session) => session.id === sessionId);
+    if (existingSession?.title && !isAiPlaceholderTitle(existingSession.title)) return;
+    const title = await generateAiSessionTitle(prompt);
+    if (!title) return;
+    aiSessionTitleOverrides = { ...aiSessionTitleOverrides, [sessionId]: title };
+    await saveAiSessionTitleOverrides();
+    await refreshAiSessions();
+  }
+
   function getFilteredAiSessions(): AiSessionSummary[] {
     const query = aiSessionSearch.trim().toLowerCase();
     if (!query) return aiSessions;
     return aiSessions.filter((session) => {
       const haystacks = [
+        getAiSessionDisplayTitle(session),
         session.title || '',
         session.lastUserMessage || '',
         session.lastAssistantMessage || '',
@@ -1120,34 +1325,19 @@
 
   function restoreAiSessionIntoTab(tabId: string, detail: AiSessionDetail) {
     clearAiBlocksForTab(tabId);
-
-    const state = detail.state;
-    if (!state) return;
-
-    const restoredBlock = createAiBlock(tabId, {
-      prompt: state.prompt || detail.lastUserMessage || '',
-      attachments: [],
-      phase: mapLivePhase(state.phase),
-      commands: state.commands || [],
-      toolCalls: [],
-      error: state.error || '',
-      raw: state.raw || '',
-      response: state.response || detail.lastAssistantMessage || '',
-    });
-
-    if (restoredBlock.phase !== 'done' && restoredBlock.phase !== 'error' && restoredBlock.phase !== 'answered') {
-      activeBlockId = restoredBlock.id;
-    }
+    liveChatMessages = detail.state?.messages ?? [];
+    if (detail.state?.model) selectedAiModel = detail.state.model;
+    syncAiBlocksFromChatMessages(tabId, liveChatMessages);
   }
 
-  async function createAiSession(title?: string) {
+  async function createAiSession(title?: string, tab: Tab | undefined = focusedTab()) {
     const session = await invoke<AiSessionSummary>('ai_create_session', {
       baseUrl: aiAccountId,
       apiToken: aiApiToken,
       title: title || null,
       model: selectedAiModel,
     });
-    currentAiSessionId = session.id;
+    setTabAiState(tab, session.id, []);
     await refreshAiSessions();
     return session;
   }
@@ -1155,18 +1345,24 @@
   async function resumeAiSession(session: AiSessionSummary) {
     const tab = focusedTab();
     if (!tab) return;
-    if (liveAgentClient && currentAiSessionId !== session.id) {
+    if (currentAiSessionId !== session.id && liveAgentChat) {
+      liveAgentChat.close();
+      liveAgentChat = null;
+      liveAgentClient = null;
+      liveAgentSessionName = '';
+    } else if (liveAgentClient && currentAiSessionId !== session.id) {
       liveAgentClient.close();
       liveAgentClient = null;
       liveAgentSessionName = '';
     }
-    currentAiSessionId = session.id;
+    setTabAiState(tab, session.id, []);
     selectedAiModel = session.model || selectedAiModel;
     agenticMode = true;
     aiSessionsSidebarOpen = true;
     aiSessionActionError = '';
     try {
       const detail = await loadAiSessionDetail(session.id);
+      setTabAiState(tab, session.id, detail.state?.messages ?? []);
       restoreAiSessionIntoTab(tab.id, detail);
       await ensureLiveAgentConnection();
     } catch (e) {
@@ -1175,18 +1371,21 @@
     tick().then(() => focusInput());
   }
 
-  function startNewAiSession() {
-    currentAiSessionId = '';
-    if (liveAgentClient) {
-      liveAgentClient.close();
-      liveAgentClient = null;
-      liveAgentSessionName = '';
-    }
+  async function startNewAiSession() {
+    const tab = await createTab();
+    if (!tab) return;
+    resetLiveAgentConnection();
+    setTabAiState(tab, '', []);
+    clearAiBlocksForTab(tab.id);
+    agenticMode = true;
     aiSessionsSidebarOpen = true;
     aiSessionSearch = '';
     aiSessionActionError = '';
-    const tab = focusedTab();
-    if (tab) clearAiBlocksForTab(tab.id);
+    try {
+      await createAiSession(undefined, tab);
+    } catch (e) {
+      aiSessionActionError = String(e);
+    }
     tick().then(() => focusInput());
   }
 
@@ -1195,15 +1394,51 @@
     return trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed;
   }
 
+  function getKuratchiLiveConnectionTarget(): { host: string; protocol: 'ws' | 'wss' } {
+    const normalizedBaseUrl = normalizeBaseUrl(aiAccountId);
+    const parsed = new URL(normalizedBaseUrl);
+    return {
+      host: parsed.host,
+      protocol: parsed.protocol === 'https:' ? 'wss' : 'ws',
+    };
+  }
+
+  async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 8000): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort('timeout'), timeoutMs);
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new Error(`Kuratchi request timed out after ${Math.round(timeoutMs / 1000)}s`);
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
   async function kuratchiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${normalizeBaseUrl(aiAccountId)}${path}`, {
-      ...init,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${aiApiToken}`,
-        ...(init.headers || {}),
-      },
-    });
+    const baseUrl = normalizeBaseUrl(aiAccountId);
+    const url = `${baseUrl}${path}`;
+    let response: Response;
+
+    try {
+      response = await fetchWithTimeout(url, {
+        ...init,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${aiApiToken}`,
+          ...(init.headers || {}),
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to reach Kuratchi at ${url}: ${message}`);
+    }
 
     const payload = await response.json().catch(() => null) as { success?: boolean; data?: T; error?: string } | null;
     if (!response.ok || !payload?.success) {
@@ -1212,36 +1447,282 @@
     return payload.data as T;
   }
 
-  function mapLivePhase(phase: LiveIdeState['phase']): AiBlock['phase'] {
-    switch (phase) {
-      case 'thinking': return 'thinking';
-      case 'approval': return 'commands';
-      case 'executing': return 'executing';
-      case 'needs_input': return 'needs_input';
-      case 'answered': return 'answered';
-      case 'error': return 'error';
-      default: return 'done';
+  function isLiveCommandToolPart(part: LiveChatPart): part is LiveChatPart & {
+    type: 'tool-run_terminal_commands' | 'tool-runterminalcommands';
+    toolName: 'run_terminal_commands' | 'runterminalcommands';
+    toolCallId: string;
+    state: 'input-available' | 'approval-requested' | 'approval-responded' | 'output-available' | 'output-error' | 'output-denied';
+    input: { commands?: string[] };
+    output?: { results?: { command?: string; output?: string }[] };
+    errorText?: string;
+    approval?: { id?: string };
+  } {
+    return part.type === 'tool-run_terminal_commands' || part.type === 'tool-runterminalcommands';
+  }
+
+  function getLiveMessageParts(message: LiveChatMessage): LiveChatPart[] {
+    return Array.isArray(message.parts) ? message.parts : [];
+  }
+
+  function normalizeLiveAssistantText(text: string): string {
+    const trimmed = text.trim();
+    if (trimmed.startsWith('ANSWER:')) {
+      return trimmed.substring('ANSWER:'.length).trim();
+    }
+    if (trimmed.startsWith('ERROR:')) {
+      return trimmed.substring('ERROR:'.length).trim();
+    }
+    return trimmed;
+  }
+
+  function extractPseudoTerminalToolCall(text: string): { commands: string[]; cleanedText: string } | null {
+    const marker = text.indexOf('{"name"');
+    if (marker === -1) return null;
+
+    let depth = 0;
+    let endIndex = -1;
+    for (let index = marker; index < text.length; index += 1) {
+      const char = text[index];
+      if (char === '{') depth += 1;
+      if (char === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          endIndex = index;
+          break;
+        }
+      }
+    }
+
+    if (endIndex === -1) return null;
+
+    const candidate = text.slice(marker, endIndex + 1);
+    try {
+      const parsed = JSON.parse(candidate) as { name?: string; parameters?: { commands?: unknown } };
+      if (parsed.name !== 'runterminalcommands') return null;
+      if (!Array.isArray(parsed.parameters?.commands)) return null;
+
+      const commands = parsed.parameters.commands.filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+      if (commands.length === 0) return null;
+
+      const cleanedText = `${text.slice(0, marker)}${text.slice(endIndex + 1)}`.trim();
+      return { commands, cleanedText };
+    } catch {
+      return null;
     }
   }
 
-  function syncAiBlockFromLiveState(state: LiveIdeState) {
-    const blockId = liveAgentActiveBlockId;
-    if (!blockId) return;
-    const existingBlock = aiBlocks.find((block) => block.id === blockId);
-    const previousPhase = existingBlock?.phase ?? null;
-    updateAiBlock(blockId, {
-      prompt: state.prompt || existingBlock?.prompt || '',
-      phase: mapLivePhase(state.phase),
-      commands: state.commands || [],
-      raw: state.raw || '',
-      response: state.response || '',
-      error: state.error || '',
-    });
-    if (state.sessionId) currentAiSessionId = state.sessionId;
-    if (state.phase === 'approval' && aiExecMode === 'auto' && previousPhase !== 'commands') {
-      pendingCommand = state.commands?.[0]?.text || '';
-      activeBlockId = blockId;
-      void executePendingCommand();
+  function extractLiveMessageText(message: LiveChatMessage): string {
+    const textFromParts = getLiveMessageParts(message)
+      .filter((part): part is LiveChatPart & { type: 'text'; text: string } => part.type === 'text')
+      .map((part) => part.text)
+      .join('')
+      .trim();
+
+    if (textFromParts) {
+      return message.role === 'assistant' ? normalizeLiveAssistantText(textFromParts) : textFromParts;
+    }
+
+    const maybeContent = (message as { content?: unknown }).content;
+    if (typeof maybeContent === 'string' && maybeContent.trim()) {
+      return message.role === 'assistant' ? normalizeLiveAssistantText(maybeContent) : maybeContent.trim();
+    }
+
+    if (Array.isArray(maybeContent)) {
+      const textFromContent = maybeContent
+        .map((part) => {
+          if (typeof part === 'string') return part;
+          if (part && typeof part === 'object' && 'text' in part && typeof part.text === 'string') {
+            return part.text;
+          }
+          return '';
+        })
+        .join('')
+        .trim();
+      if (textFromContent) {
+        return message.role === 'assistant' ? normalizeLiveAssistantText(textFromContent) : textFromContent;
+      }
+    }
+
+    const maybeText = (message as { text?: unknown }).text;
+    if (typeof maybeText === 'string' && maybeText.trim()) {
+      return message.role === 'assistant' ? normalizeLiveAssistantText(maybeText) : maybeText.trim();
+    }
+
+    return '';
+  }
+
+  function syncAiBlocksFromChatMessages(tabId: string, messages: LiveChatMessage[]) {
+    const previousBlocks = getAiBlocks(tabId);
+    const previousPendingToolId = previousBlocks.findLast((block) => block.phase === 'commands')?.liveToolCallId || '';
+    const optimisticBlock = previousBlocks.findLast(
+      (block) => block.phase === 'thinking' || block.phase === 'commands' || block.phase === 'executing'
+    ) ?? null;
+    const mappedBlocks: AiBlock[] = [];
+    let currentBlock: AiBlock | null = null;
+
+    if (messages.length === 0) {
+      return;
+    }
+
+    for (const message of messages) {
+      if (message.role === 'user') {
+        const prompt = extractLiveMessageText(message);
+        const reusedBlock =
+          optimisticBlock && mappedBlocks.length === 0 && (!prompt || optimisticBlock.prompt === prompt)
+            ? optimisticBlock
+            : null;
+        currentBlock = {
+          id: reusedBlock?.id ?? ++aiBlockIdCounter,
+          tabId,
+          prompt: prompt || reusedBlock?.prompt || '',
+          attachments: reusedBlock?.attachments ?? [],
+          phase: 'thinking',
+          commands: reusedBlock?.commands ?? [],
+          toolCalls: reusedBlock?.toolCalls ?? [],
+          error: '',
+          raw: '',
+          response: '',
+          liveToolCallId: reusedBlock?.liveToolCallId,
+          liveApprovalId: reusedBlock?.liveApprovalId,
+          liveToolName: reusedBlock?.liveToolName,
+        };
+        mappedBlocks.push(currentBlock);
+        continue;
+      }
+
+      if (message.role !== 'assistant') continue;
+      if (!currentBlock) {
+        const reusedBlock = mappedBlocks.length === 0 ? optimisticBlock : null;
+        currentBlock = {
+          id: reusedBlock?.id ?? ++aiBlockIdCounter,
+          tabId,
+          prompt: reusedBlock?.prompt || '',
+          attachments: reusedBlock?.attachments ?? [],
+          phase: reusedBlock?.phase ?? 'thinking',
+          commands: reusedBlock?.commands ?? [],
+          toolCalls: reusedBlock?.toolCalls ?? [],
+          error: '',
+          raw: '',
+          response: '',
+          liveToolCallId: reusedBlock?.liveToolCallId,
+          liveApprovalId: reusedBlock?.liveApprovalId,
+          liveToolName: reusedBlock?.liveToolName,
+        };
+        mappedBlocks.push(currentBlock);
+      }
+
+      const responseText = extractLiveMessageText(message);
+      const pseudoToolCall = responseText ? extractPseudoTerminalToolCall(responseText) : null;
+      const rawParts: string[] = [];
+      let hasPendingTool = false;
+      let hasToolOutput = false;
+
+      if (responseText) {
+        currentBlock.response = pseudoToolCall?.cleanedText || responseText;
+      }
+
+      if (pseudoToolCall && currentBlock.commands.length === 0) {
+        currentBlock.liveToolCallId = currentBlock.liveToolCallId || `pseudo:${crypto.randomUUID()}`;
+        currentBlock.liveToolName = 'runterminalcommands';
+        currentBlock.commands = pseudoToolCall.commands.map((command) => ({
+          text: command,
+          status: 'pending' as const,
+          output: '',
+        }));
+        currentBlock.phase = 'commands';
+        hasPendingTool = true;
+      }
+
+      for (const part of getLiveMessageParts(message)) {
+        if (!isLiveCommandToolPart(part)) continue;
+
+        rawParts.push(JSON.stringify(part));
+        currentBlock.liveToolCallId = part.toolCallId;
+        currentBlock.liveApprovalId = part.approval?.id;
+        currentBlock.liveToolName = part.toolName;
+        currentBlock.commands = Array.isArray(part.input?.commands)
+          ? part.input.commands.map((command, index) => {
+              const result = Array.isArray(part.output?.results) ? part.output.results[index] : undefined;
+              let status: AiCmdEntry['status'] = 'pending';
+              if (part.state === 'approval-responded') status = 'running';
+              else if (part.state === 'output-available') status = 'done';
+              else if (part.state === 'output-error') status = 'error';
+              return {
+                text: command,
+                status,
+                output: result?.output || '',
+              };
+            })
+          : [];
+
+        switch (part.state) {
+          case 'approval-requested':
+          case 'input-available':
+            currentBlock.phase = 'commands';
+            hasPendingTool = true;
+            break;
+          case 'approval-responded':
+            liveToolCallsInFlight.delete(part.toolCallId);
+            liveToolCallsHandled.add(part.toolCallId);
+            currentBlock.phase = 'executing';
+            hasPendingTool = true;
+            break;
+          case 'output-available':
+            liveToolCallsInFlight.delete(part.toolCallId);
+            liveToolCallsHandled.add(part.toolCallId);
+            currentBlock.phase = responseText ? 'answered' : 'executing';
+            hasToolOutput = true;
+            break;
+          case 'output-error':
+            liveToolCallsInFlight.delete(part.toolCallId);
+            liveToolCallsHandled.add(part.toolCallId);
+            currentBlock.phase = 'error';
+            currentBlock.error = part.errorText || 'Terminal tool execution failed';
+            break;
+          case 'output-denied':
+            liveToolCallsInFlight.delete(part.toolCallId);
+            liveToolCallsHandled.add(part.toolCallId);
+            currentBlock.phase = 'answered';
+            currentBlock.response = currentBlock.response || 'Execution dismissed.';
+            break;
+        }
+      }
+
+      currentBlock.raw = rawParts.join('\n');
+      if (!currentBlock.error) {
+        if (currentBlock.response && !hasPendingTool) {
+          currentBlock.phase = 'answered';
+        } else if (hasToolOutput && !currentBlock.response) {
+          currentBlock.phase = 'executing';
+        }
+      }
+    }
+
+    if (mappedBlocks.length === 0 && optimisticBlock) {
+      aiBlocks = [...aiBlocks.filter((block) => block.tabId !== tabId), optimisticBlock];
+      activeBlockId = optimisticBlock.id;
+      return;
+    }
+
+    aiBlocks = [...aiBlocks.filter((block) => block.tabId !== tabId), ...mappedBlocks];
+
+    const activeBlock = mappedBlocks.findLast((block) => block.phase !== 'answered' && block.phase !== 'done' && block.phase !== 'error');
+    if (activeBlock) activeBlockId = activeBlock.id;
+
+    const nextPendingToolId = mappedBlocks.findLast((block) => block.phase === 'commands')?.liveToolCallId || '';
+    if (
+      aiExecMode === 'auto' &&
+      nextPendingToolId &&
+      nextPendingToolId !== previousPendingToolId &&
+      !liveToolCallsInFlight.has(nextPendingToolId) &&
+      !liveToolCallsHandled.has(nextPendingToolId)
+    ) {
+      liveToolCallsInFlight.add(nextPendingToolId);
+      pendingCommand = mappedBlocks.findLast((block) => block.liveToolCallId === nextPendingToolId)?.commands[0]?.text || '';
+      if (activeBlock) {
+        activeBlockId = activeBlock.id;
+        void executePendingCommand();
+      }
     }
   }
 
@@ -1260,11 +1741,131 @@
     };
   }
 
-  async function ensureLiveAgentConnection(): Promise<AgentClient<LiveIdeState>> {
-    if (liveAgentClient && liveAgentSessionName && currentAiSessionId && liveAgentSessionName.endsWith(`:${currentAiSessionId}`)) {
-      return liveAgentClient;
+  async function submitLiveAgentPrompt(tab: Tab, prompt: string) {
+    const client = await ensureLiveAgentConnection();
+    client.sendMessage(
+      {
+        id: `user_${crypto.randomUUID()}`,
+        role: 'user',
+        parts: [{ type: 'text', text: prompt }],
+      },
+      buildLivePromptOptions(tab)
+    );
+    return client.client;
+  }
+
+  function handleLiveAgentStatus(status: KuratchiChatStatus) {
+    aiLoading = status === 'submitted' || status === 'streaming';
+    if (status !== 'error') {
+      aiSessionActionError = '';
+    }
+  }
+
+  function hasActiveLiveTurn(tabId: string): boolean {
+    if (liveAgentChat?.hasActiveRequest()) {
+      return true;
     }
 
+    const activeBlock = getActiveAiBlock(tabId);
+    return !!activeBlock && ['thinking', 'commands', 'executing', 'retrying', 'needs_input'].includes(activeBlock.phase);
+  }
+
+  function finalizeInterruptedLiveBlock(tabId: string) {
+    const activeBlock = getActiveAiBlock(tabId);
+    if (!activeBlock) return;
+
+    if (
+      activeBlock.phase === 'thinking' &&
+      !activeBlock.response &&
+      activeBlock.commands.length === 0 &&
+      activeBlock.toolCalls.length === 0
+    ) {
+      removeAiBlock(activeBlock.id);
+      return;
+    }
+
+    updateAiBlock(activeBlock.id, {
+      phase: activeBlock.response ? 'answered' : 'done',
+      error: '',
+    });
+  }
+
+  async function submitCloudflarePrompt(tab: Tab, input: string, blockAttachments: AiBlockAttachment[], blockId?: number) {
+    let block = blockId ? aiBlocks.find((entry) => entry.id === blockId) : null;
+    if (!block) {
+      tab.inputValue = '';
+      resetInputHeight(tab.id);
+      block = createAiBlock(tab.id, { prompt: input, attachments: blockAttachments, phase: 'thinking' });
+      activeBlockId = block.id;
+      scrollToBottom();
+    }
+    aiLoading = true;
+
+    try {
+      if (!tab.aiSessionId) {
+        await createAiSession(undefined, tab);
+      }
+      await submitLiveAgentPrompt(tab, input);
+      if (tab.aiSessionId) {
+        void ensureSessionTitleForPrompt(tab.aiSessionId, input);
+      }
+      aiAttachments = [];
+      pendingCommand = '';
+      return true;
+    } catch (e) {
+      console.error('Live agent submit failed, retrying live connection:', e);
+      resetLiveAgentConnection();
+      try {
+        if (!tab.aiSessionId) {
+          await createAiSession(undefined, tab);
+        }
+        await submitLiveAgentPrompt(tab, input);
+        if (tab.aiSessionId) {
+          void ensureSessionTitleForPrompt(tab.aiSessionId, input);
+        }
+        aiAttachments = [];
+        pendingCommand = '';
+        return true;
+      } catch (retryError) {
+        updateAiBlock(block.id, { phase: 'error', error: formatAiError(retryError) });
+        aiLoading = false;
+        scrollToBottom();
+        return false;
+      }
+    }
+  }
+
+  function dismissLiveInterruptDialog() {
+    liveInterruptDialogOpen = false;
+    liveInterruptDraft = null;
+  }
+
+  async function resolveLiveInterrupt(mode: 'steer' | 'send') {
+    const tab = focusedTab();
+    if (!tab || !liveInterruptDraft) {
+      dismissLiveInterruptDialog();
+      return;
+    }
+
+    const draft = liveInterruptDraft;
+    dismissLiveInterruptDialog();
+    liveAgentChat?.cancelActiveRequest();
+    finalizeInterruptedLiveBlock(tab.id);
+
+    const nextPrompt =
+      mode === 'steer'
+        ? `The user interrupted your previous response. Stop that response and address this new request instead:\n\n${draft.prompt}`
+        : draft.prompt;
+
+    await submitCloudflarePrompt(tab, nextPrompt, draft.attachments);
+  }
+
+  async function ensureLiveAgentConnection(): Promise<KuratchiAgentChat<LiveChatMessage>> {
+    if (liveAgentChat && liveAgentSessionName && currentAiSessionId && liveAgentSessionName.endsWith(`:${currentAiSessionId}`)) {
+      return liveAgentChat;
+    }
+
+    const tab = focusedTab();
     liveAgentConnecting = true;
     try {
       const connection = await kuratchiRequest<LiveAgentConnectResponse>('/api/v1/ai/ide/connect', {
@@ -1274,35 +1875,95 @@
           model: selectedAiModel,
         }),
       });
+      const liveTarget = getKuratchiLiveConnectionTarget();
+      const liveQuery = new URLSearchParams(connection.agent.query || {}).toString();
+      liveAgentUrl = `${liveTarget.protocol}://${liveTarget.host}/${connection.agent.basePath || `agents/${connection.agent.agent}/${connection.agent.name}`}${liveQuery ? `?${liveQuery}` : ''}`;
 
-      currentAiSessionId = connection.session.id;
-      if (liveAgentClient) liveAgentClient.close();
+      setTabAiState(tab, connection.session.id, tab?.aiMessages ?? []);
+      if (liveAgentChat) {
+        liveAgentChat.close();
+        liveAgentChat = null;
+      } else if (liveAgentClient) {
+        liveAgentClient.close();
+      }
 
-      liveAgentClient = new AgentClient<LiveIdeState>({
+      let resolveOpen: (() => void) | null = null;
+      let rejectOpen: ((error: Error) => void) | null = null;
+      const opened = new Promise<void>((resolve, reject) => {
+        resolveOpen = resolve;
+        rejectOpen = reject;
+      });
+
+      liveAgentClient = new AgentClient({
         agent: connection.agent.agent,
         name: connection.agent.name,
-        host: connection.agent.host,
-        protocol: connection.agent.protocol,
+        basePath: connection.agent.basePath,
+        host: liveTarget.host,
+        protocol: liveTarget.protocol,
         query: connection.agent.query,
         onIdentity: (name) => {
           liveAgentSessionName = name;
         },
-        onStateUpdate: (state) => {
-          syncAiBlockFromLiveState(state);
+      });
+      liveAgentClient.addEventListener('open', () => {
+        resolveOpen?.();
+      }, { once: true });
+      liveAgentClient.addEventListener('close', () => {
+        rejectOpen?.(new Error(`Kuratchi live agent connection closed before it became ready (${liveAgentUrl || 'unknown url'})`));
+      }, { once: true });
+      liveAgentClient.addEventListener('error', () => {
+        rejectOpen?.(new Error(`Kuratchi live agent connection failed (${liveAgentUrl || 'unknown url'})`));
+      }, { once: true });
+      liveAgentChat = new KuratchiAgentChat<LiveChatMessage>(liveAgentClient, {
+        onMessagesChange: (messages) => {
+          liveChatMessages = messages;
+          const activeTab = focusedTab();
+          if (activeTab) {
+            activeTab.aiMessages = [...messages];
+            syncAiBlocksFromChatMessages(activeTab.id, liveChatMessages);
+          }
+        },
+        onStatusChange: (status) => {
+          handleLiveAgentStatus(status);
+        },
+        onError: (error) => {
+          console.error('Kuratchi live agent error:', error);
+          aiSessionActionError = error.message;
         },
       });
+      liveAgentChat.attach();
+      liveAgentChat.hydrate(tab?.aiMessages ?? liveChatMessages);
       await Promise.race([
-        liveAgentClient.ready,
+        opened,
         new Promise<never>((_, reject) => {
-          window.setTimeout(() => reject(new Error('Timed out connecting to Kuratchi live agent')), 8000);
+          window.setTimeout(() => reject(new Error(`Timed out opening Kuratchi live agent connection (${liveAgentUrl || 'unknown url'})`)), 8000);
         }),
       ]);
-      liveAgentSessionName = liveAgentClient.name;
+      liveAgentSessionName = connection.agent.name;
+      try {
+        liveAgentChat.resume();
+      } catch (error) {
+        console.warn('Kuratchi live agent resume failed during bootstrap:', error);
+      }
       await refreshAiSessions();
-      return liveAgentClient;
+      return liveAgentChat;
     } finally {
       liveAgentConnecting = false;
     }
+  }
+
+  function resetLiveAgentConnection() {
+    if (liveAgentChat) {
+      liveAgentChat.close();
+      liveAgentChat = null;
+    } else if (liveAgentClient) {
+      liveAgentClient.close();
+    }
+    liveAgentClient = null;
+    liveAgentSessionName = '';
+    liveAgentUrl = '';
+    liveToolCallsInFlight = new Set();
+    liveToolCallsHandled = new Set();
   }
 
   async function saveSettings(accountId: string, apiToken: string) {
@@ -1315,6 +1976,7 @@
       await strongholdInsert('ai_api_token', apiToken);
       aiAccountId = accountId;
       aiApiToken = apiToken;
+      await refreshKuratchiModels();
       await refreshAiSessions();
     } catch (e) {
       console.error('Failed to save settings:', e);
@@ -1331,6 +1993,7 @@
       await strongholdRemove('ai_api_token');
       aiAccountId = '';
       aiApiToken = '';
+      cloudflareAiModels = [];
       aiSessions = [];
       currentAiSessionId = '';
       agenticMode = false;
@@ -1358,6 +2021,30 @@
       }
     } catch (e) {
       console.error('Failed to revoke Gemini key:', e);
+    }
+  }
+
+  async function saveProviderKey(providerId: string, apiKey: string) {
+    try {
+      await strongholdInsert(`provider_key_${providerId}`, apiKey);
+      providerApiKeys[providerId] = apiKey;
+    } catch (e) {
+      console.error(`Failed to save ${providerId} key:`, e);
+    }
+  }
+
+  async function revokeProviderKey(providerId: string) {
+    try {
+      await strongholdRemove(`provider_key_${providerId}`);
+      delete providerApiKeys[providerId];
+      providerApiKeys = { ...providerApiKeys };
+      // If currently using a model from this provider, switch back to default
+      const currentProvider = getProviderForModel(selectedAiModel);
+      if (currentProvider?.id === providerId) {
+        selectedAiModel = '@cf/meta/llama-4-scout-17b-16e-instruct';
+      }
+    } catch (e) {
+      console.error(`Failed to revoke ${providerId} key:`, e);
     }
   }
 
@@ -1877,6 +2564,10 @@
     error: string;
     raw: string;
     response: string;
+    liveToolCallId?: string;
+    liveApprovalId?: string;
+    liveToolName?: string;
+    generatedImage?: { data: string; mimeType: string };
   }
   let aiBlocks: AiBlock[] = $state([]);
   let aiExecDropdownOpen = $state(false);
@@ -1923,8 +2614,68 @@
     aiExecDropdownOpen = false;
   }
 
+  function formatAiError(e: unknown): string {
+    const msg = typeof e === 'string' ? e : (e as any)?.message || String(e);
+    
+    // Handle typical 429 Too Many Requests or RESOURCE_EXHAUSTED
+    if (msg.includes('429 Too Many Requests') || msg.includes('429') || msg.includes('"RESOURCE_EXHAUSTED"')) {
+      try {
+        const braceIdx = msg.indexOf('{');
+        if (braceIdx !== -1) {
+          const parsed = JSON.parse(msg.substring(braceIdx));
+          if (parsed.error && parsed.error.message) {
+            // Take the first couple of sentences so we don't display a massive block of metrics
+            const shortMsg = parsed.error.message.split(' For more information')[0].trim();
+            return `Rate Limit Exceeded: ${shortMsg} Please try again later or check your API quotas.`;
+          }
+        }
+      } catch {
+        // ignore parse error and fallthrough
+      }
+      return "Rate limit exceeded. You may have run out of API quota or hit a request limit. Please wait a moment and try again.";
+    }
+
+    // Try to strip out raw JSON dumps if they are huge
+    try {
+        const braceIdx = msg.indexOf('{');
+        if (braceIdx !== -1 && braceIdx > 0 && braceIdx < 100) {
+            const prefix = msg.substring(0, braceIdx).trim();
+            const parsed = JSON.parse(msg.substring(braceIdx));
+            if (parsed.error && parsed.error.message) {
+                return `${prefix} ${parsed.error.message}`;
+            }
+        }
+    } catch {}
+
+    return `AI request failed: ${msg}`;
+  }
+
   function renderAiAnswer(response: string): string {
     return renderMarkdown(response.trim());
+  }
+
+  function buildExecutionSummary(block: AiBlock): string {
+    const successfulCommands = block.commands.filter((command) => command.status === 'done');
+    const failedCommands = block.commands.filter((command) => command.status === 'error');
+
+    if (failedCommands.length > 0) {
+      return `Some commands failed after ${successfulCommands.length} successful step${successfulCommands.length === 1 ? '' : 's'}. Review the command output above.`;
+    }
+
+    if (successfulCommands.length === 0) {
+      return 'Command execution finished.';
+    }
+
+    const lastCommand = successfulCommands[successfulCommands.length - 1]?.text || '';
+    if (/mkdir|New-Item\s+-ItemType\s+Directory/i.test(lastCommand)) {
+      return 'The directory was created successfully.';
+    }
+
+    if (/index\.html/i.test(block.commands.map((command) => command.text).join('\n'))) {
+      return 'The requested files were created successfully. Review the command output above for the exact paths.';
+    }
+
+    return `Executed ${successfulCommands.length} step${successfulCommands.length === 1 ? '' : 's'} successfully.`;
   }
 
   function getAiExecutedCount(block: AiBlock): number {
@@ -1999,7 +2750,7 @@
   }
 
   function getSelectedModelName(): string {
-    return AI_MODELS.find(m => m.id === selectedAiModel)?.name || 'Llama 4 Scout';
+    return getAllAiModels().find(m => m.id === selectedAiModel)?.name || 'Llama 4 Scout';
   }
 
   async function handlePaste(e: ClipboardEvent) {
@@ -2058,6 +2809,14 @@
     if (!tab || !tab.inputValue.trim() || !tab.connected) return;
 
     const input = tab.inputValue.trim();
+    const provider = getSelectedModelProvider();
+    const blockAttachments = aiAttachments.map(a => ({ name: a.name, content: a.content, mimeType: a.mimeType }));
+
+    if (provider === 'cloudflare' && hasActiveLiveTurn(tab.id)) {
+      liveInterruptDraft = { prompt: input, attachments: blockAttachments };
+      liveInterruptDialogOpen = true;
+      return;
+    }
 
     // Passthrough: basic shell commands run inline in the conversation
     if (isBasicShellCommand(input)) {
@@ -2095,21 +2854,11 @@
       resetInputHeight(tab.id);
       aiExecPromptShown = true;
       // Store attachments with the block for history
-      const blockAttachments = aiAttachments.map(a => ({ name: a.name, content: a.content, mimeType: a.mimeType }));
       const block = createAiBlock(tab.id, { prompt: input, attachments: blockAttachments, phase: 'choosing' });
       activeBlockId = block.id;
       scrollToBottom();
       return;
     }
-
-    tab.inputValue = '';
-    resetInputHeight(tab.id);
-    // Store attachments with the block for history
-    const blockAttachments = aiAttachments.map(a => ({ name: a.name, content: a.content, mimeType: a.mimeType }));
-    const block = createAiBlock(tab.id, { prompt: input, attachments: blockAttachments, phase: 'thinking' });
-    activeBlockId = block.id;
-    scrollToBottom();
-    aiLoading = true;
 
     // Check if this is a code modification request with a text file attachment
     const promptLower = input.toLowerCase();
@@ -2127,15 +2876,39 @@
     const filePathMatches = input.match(filePathRegex);
     const detectedFilePath = filePathMatches ? filePathMatches[0].trim().replace(/[,;:]$/, '') : null;
     
-    const provider = getSelectedModelProvider();
+    // If modification request with text file attachment, use code edit flow
+    tab.inputValue = '';
+    resetInputHeight(tab.id);
+    const block = createAiBlock(tab.id, { prompt: input, attachments: blockAttachments, phase: 'thinking' });
+    activeBlockId = block.id;
+    scrollToBottom();
+    aiLoading = true;
+
+    // In Kuratchi/Cloudflare mode, always let the live agent decide whether
+    // to answer directly, edit files, or request terminal commands.
+    if (provider === 'cloudflare') {
+      await submitCloudflarePrompt(tab, input, blockAttachments, block.id);
+      return;
+    }
 
     // If modification request with text file attachment, use code edit flow
     if (isModificationRequest && textFileAttachment) {
       try {
         console.log('[AI] Code edit request detected for:', textFileAttachment.name);
+        const providerObj = getProviderForModel(selectedAiModel);
         const editResult: CodeEditResult = provider === 'gemini'
           ? await invoke('ai_gemini_edit_code', {
               apiKey: geminiApiKey,
+              model: selectedAiModel,
+              fileName: textFileAttachment.name,
+              filePath: textFileAttachment.path || null,
+              fileContent: textFileAttachment.content,
+              instruction: input,
+            })
+          : provider === 'openai'
+          ? await invoke('ai_openai_edit_code', {
+              baseUrl: getProviderBaseUrl(providerObj?.id || 'openai'),
+              apiKey: getProviderApiKey(providerObj?.id || 'openai'),
               model: selectedAiModel,
               fileName: textFileAttachment.name,
               filePath: textFileAttachment.path || null,
@@ -2178,12 +2951,16 @@
     if (isModificationRequest && detectedFilePath && !textFileAttachment) {
       try {
         console.log('[AI] Code edit from path detected:', detectedFilePath);
-        const editResult: CodeEditResult = await invoke(
-          provider === 'gemini' ? 'ai_gemini_edit_code_from_path' : 'ai_edit_code_from_path',
-          provider === 'gemini'
-            ? { apiKey: geminiApiKey, model: selectedAiModel, filePath: detectedFilePath, instruction: input, cwd: tab.cwd || null }
-            : { baseUrl: aiAccountId, apiToken: aiApiToken, model: selectedAiModel, filePath: detectedFilePath, instruction: input, cwd: tab.cwd || null }
-        );
+        const providerObj2 = getProviderForModel(selectedAiModel);
+        const editFromPathCmd = provider === 'gemini' ? 'ai_gemini_edit_code_from_path'
+          : provider === 'openai' ? 'ai_openai_edit_code_from_path'
+          : 'ai_edit_code_from_path';
+        const editFromPathArgs = provider === 'gemini'
+          ? { apiKey: geminiApiKey, model: selectedAiModel, filePath: detectedFilePath, instruction: input, cwd: tab.cwd || null }
+          : provider === 'openai'
+          ? { baseUrl: getProviderBaseUrl(providerObj2?.id || 'openai'), apiKey: getProviderApiKey(providerObj2?.id || 'openai'), model: selectedAiModel, filePath: detectedFilePath, instruction: input, cwd: tab.cwd || null }
+          : { baseUrl: aiAccountId, apiToken: aiApiToken, model: selectedAiModel, filePath: detectedFilePath, instruction: input, cwd: tab.cwd || null };
+        const editResult: CodeEditResult = await invoke(editFromPathCmd, editFromPathArgs);
         
         // Store the pending edit and show in diff viewer
         pendingCodeEdit = editResult;
@@ -2206,21 +2983,6 @@
       }
     }
 
-    // Live agent only works with Kuratchi (Cloudflare)
-    if (provider === 'cloudflare') {
-      try {
-        const client = await ensureLiveAgentConnection();
-        liveAgentActiveBlockId = block.id;
-        await client.call('submitPrompt', [input, buildLivePromptOptions(tab)]);
-        aiAttachments = [];
-        aiLoading = false;
-        pendingCommand = '';
-        return;
-      } catch (e) {
-        console.error('Live agent submit failed, falling back to REST path:', e);
-      }
-    }
-
     // Step 1: Get commands/tool calls from AI (MCP-aware)
     let rawResponse: string;
     const attachmentPayload = aiAttachments.map(a => ({
@@ -2229,9 +2991,46 @@
       mimeType: a.mimeType,
     }));
     try {
+      // Image generation models get a special dispatch path
+      if (isImageGenerationModel(selectedAiModel) && provider === 'gemini') {
+        const result: { image_data: string; mime_type: string; text: string } = await invoke('ai_gemini_generate_image', {
+          apiKey: geminiApiKey,
+          model: selectedAiModel,
+          prompt: input,
+        });
+        aiAttachments = [];
+        const responseText = result.text || 'Image generated successfully.';
+        updateAiBlock(block.id, {
+          phase: 'answered',
+          response: responseText,
+          raw: responseText,
+          generatedImage: { data: result.image_data, mimeType: result.mime_type },
+        });
+        // Open the image in the preview pane
+        previewUrl = `data:${result.mime_type};base64,${result.image_data}`;
+        previewFileName = 'Generated Image';
+        rightPane = 'preview';
+        aiLoading = false;
+        scrollToBottom();
+        return;
+      }
+
       if (provider === 'gemini') {
         rawResponse = await invoke('ai_gemini_chat', {
           apiKey: geminiApiKey,
+          model: selectedAiModel,
+          prompt: input,
+          attachments: attachmentPayload,
+          cwd: tab.cwd || null,
+          osInfo: tab.sshTarget ? (tab.remoteOs || 'Linux') : (navigator.platform || null),
+          shell: tab.sshTarget ? (tab.remoteShell || 'bash') : getLocalShellLabel(),
+          sshTarget: tab.sshTarget || null,
+        });
+      } else if (provider === 'openai') {
+        const providerObj3 = getProviderForModel(selectedAiModel);
+        rawResponse = await invoke('ai_openai_chat', {
+          baseUrl: getProviderBaseUrl(providerObj3?.id || 'openai'),
+          apiKey: getProviderApiKey(providerObj3?.id || 'openai'),
           model: selectedAiModel,
           prompt: input,
           attachments: attachmentPayload,
@@ -2259,7 +3058,7 @@
       }
       aiAttachments = [];
     } catch (e) {
-      updateAiBlock(block.id, { phase: 'error', error: `AI request failed: ${e}` });
+      updateAiBlock(block.id, { phase: 'error', error: formatAiError(e) });
       aiLoading = false;
       scrollToBottom();
       return;
@@ -2619,21 +3418,27 @@
       scrollToBottom();
     }
 
-    if (liveAgentClient && currentAiSessionId) {
+    if (liveAgentChat && currentAiSessionId && block.liveToolCallId && !block.liveToolCallId.startsWith('pseudo:')) {
       try {
-        if (failedAttempts.length > 0) {
-          await liveAgentClient.call('retryPrompt', [block.prompt, failedAttempts, buildLivePromptOptions(tab)]);
-          pendingCommand = '';
-          await tick();
-          scrollToBottom();
-          return;
-        }
-
         const commandResults = block.commands.map((command) => ({
           command: command.text,
           output: command.output,
         }));
-        await liveAgentClient.call('submitExecutionResults', [block.prompt, commandResults]);
+        liveAgentChat.addToolOutput({
+          toolCallId: block.liveToolCallId,
+          toolName: block.liveToolName || 'runterminalcommands',
+          output: {
+            results: commandResults,
+            failedAttempts,
+          },
+          ...(failedAttempts.length > 0
+            ? {
+                state: 'output-error' as const,
+                errorText: failedAttempts.map((attempt) => `${attempt.command}: ${attempt.error}`).join('\n\n'),
+              }
+            : {}),
+          autoContinue: true,
+        });
         pendingCommand = '';
         await tick();
         scrollToBottom();
@@ -2654,15 +3459,19 @@
   async function executePendingCommand() {
     const tab = focusedTab();
     const block = aiBlocks.find(b => b.id === activeBlockId);
-    if (!tab || !tab.connected || !block || block.commands.length === 0) return;
+    if (!tab || !tab.connected || !block || block.commands.length === 0 || !block.liveToolCallId) return;
     pendingCommand = '';
+    liveToolCallsInFlight.add(block.liveToolCallId);
     updateAiBlock(activeBlockId, { phase: 'executing' });
-    if (liveAgentClient && currentAiSessionId) {
-      void liveAgentClient.call('markExecuting', [block.commands]).catch((error) => {
-        console.error('Failed to mark live execution state:', error);
-      });
+    if (liveAgentChat && currentAiSessionId && !block.liveToolCallId.startsWith('pseudo:')) {
+      liveAgentChat.addToolApprovalResponse(block.liveToolCallId, true, false);
     }
-    await executeBlockInline(tab, activeBlockId);
+    try {
+      await executeBlockInline(tab, activeBlockId);
+    } finally {
+      liveToolCallsInFlight.delete(block.liveToolCallId);
+      liveToolCallsHandled.add(block.liveToolCallId);
+    }
   }
 
   function copyPendingToTerminal() {
@@ -2682,14 +3491,80 @@
     if (!tab) return;
     pendingCommand = '';
     aiExecPromptShown = false;
-    if (liveAgentClient && currentAiSessionId) {
-      void liveAgentClient.call('rejectPrompt', ['Execution dismissed by user']).catch((error) => {
-        console.error('Failed to reject live prompt:', error);
-      });
+    const block = aiBlocks.find(b => b.id === activeBlockId);
+    if (liveAgentChat && currentAiSessionId && block?.liveToolCallId && !block.liveToolCallId.startsWith('pseudo:')) {
+      liveToolCallsInFlight.delete(block.liveToolCallId);
+      liveToolCallsHandled.add(block.liveToolCallId);
+      liveAgentChat.addToolApprovalResponse(block.liveToolCallId, false, true);
     }
     // Only remove the active block (choosing/thinking/commands), keep history
     const active = getActiveAiBlock(tab.id);
     if (active) removeAiBlock(active.id);
+  }
+
+  function startAiSessionRename(session: AiSessionSummary, event?: MouseEvent) {
+    event?.stopPropagation();
+    editingAiSessionId = session.id;
+    editingAiSessionTitle = getAiSessionDisplayTitle(session);
+  }
+
+  async function commitAiSessionRename() {
+    if (!editingAiSessionId) return;
+    const title = editingAiSessionTitle.trim();
+    if (title) {
+      aiSessionTitleOverrides = { ...aiSessionTitleOverrides, [editingAiSessionId]: title };
+      await saveAiSessionTitleOverrides();
+      await refreshAiSessions();
+    }
+    editingAiSessionId = '';
+    editingAiSessionTitle = '';
+  }
+
+  function cancelAiSessionRename() {
+    editingAiSessionId = '';
+    editingAiSessionTitle = '';
+  }
+
+  async function deleteAiSession(session: AiSessionSummary) {
+    if (deletingAiSessionId || !aiAccountId || !aiApiToken) return;
+    if (!window.confirm(`Delete session "${getAiSessionDisplayTitle(session)}"?`)) return;
+
+    deletingAiSessionId = session.id;
+    aiSessionActionError = '';
+    try {
+      await invoke('ai_delete_session', {
+        baseUrl: aiAccountId,
+        apiToken: aiApiToken,
+        sessionId: session.id,
+      });
+
+      const nextOverrides = { ...aiSessionTitleOverrides };
+      delete nextOverrides[session.id];
+      aiSessionTitleOverrides = nextOverrides;
+      await saveAiSessionTitleOverrides();
+
+      for (const tab of tabs) {
+        if (tab.aiSessionId === session.id) {
+          tab.aiSessionId = '';
+          tab.aiMessages = [];
+          clearAiBlocksForTab(tab.id);
+          if (tab.id === activeTabId) {
+            resetLiveAgentConnection();
+            syncActiveAiStateFromTab(tab);
+          }
+        }
+      }
+
+      if (editingAiSessionId === session.id) {
+        cancelAiSessionRename();
+      }
+
+      await refreshAiSessions();
+    } catch (e) {
+      aiSessionActionError = String(e);
+    } finally {
+      deletingAiSessionId = '';
+    }
   }
 
   function startRename(tabId: string) {
@@ -2886,8 +3761,8 @@
     };
   }
 
-  async function createTab(): Promise<void> {
-    if (creatingTab) return;
+  async function createTab(): Promise<Tab | undefined> {
+    if (creatingTab) return undefined;
     creatingTab = true;
     tabCounter++;
     const tabId = `tab-${tabCounter}`;
@@ -2916,8 +3791,10 @@
       await tick();
       focusInput();
       setTimeout(() => updateTabState(newTab), 300);
+      return newTab;
     } catch (e) {
       console.error('Failed to create tab:', e);
+      return undefined;
     } finally {
       creatingTab = false;
     }
@@ -3215,6 +4092,11 @@
   function switchTab(tabId: string) {
     const tab = tabs.find(t => t.id === tabId);
     if (!tab) return;
+    const previousTab = focusedTab();
+    if (previousTab && previousTab.id !== tab.id) {
+      previousTab.aiSessionId = currentAiSessionId;
+      previousTab.aiMessages = [...liveChatMessages];
+    }
     transition(() => {
       activeTabId = tabId;
       if (paneLayout) {
@@ -3231,6 +4113,11 @@
         }
       }
     });
+    syncActiveAiStateFromTab(tab);
+    resetLiveAgentConnection();
+    if (tab.aiMessages.length > 0) {
+      syncAiBlocksFromChatMessages(tab.id, tab.aiMessages);
+    }
     tick().then(() => {
       scrollToBottom();
       focusInput();
@@ -3291,6 +4178,10 @@
         }
       }
     });
+
+    const nextActiveTab = tabs.find(t => t.id === activeTabId);
+    syncActiveAiStateFromTab(nextActiveTab);
+    resetLiveAgentConnection();
   }
 
   function scrollIntoAiBlock(el: HTMLElement, active: boolean) {
@@ -3783,6 +4674,7 @@
       resizeObserver?.disconnect();
       unlistenOutput?.();
       unlistenEnded?.();
+      liveAgentChat?.close();
       liveAgentClient?.close();
     };
   });
@@ -3841,12 +4733,27 @@
           <div style="padding: 12px; color: var(--text-muted);">{aiSessionSearch ? 'No sessions match your search.' : 'No sessions yet.'}</div>
         {:else}
           {#each getFilteredAiSessions() as session}
-            <button
-              onclick={() => resumeAiSession(session)}
-              style="width: 100%; text-align: left; padding: 12px; border: 1px solid color-mix(in srgb, var(--border-subtle) 90%, transparent); background: {currentAiSessionId === session.id ? 'color-mix(in srgb, var(--accent-primary) 14%, var(--bg-base))' : 'var(--bg-base)'}; color: var(--text-primary); border-radius: 12px; display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px;"
+            <div
+              style="width: 100%; text-align: left; padding: 12px; border: 1px solid color-mix(in srgb, var(--border-subtle) 90%, transparent); background: {focusedTab()?.aiSessionId === session.id ? 'color-mix(in srgb, var(--accent-primary) 14%, var(--bg-base))' : 'var(--bg-base)'}; color: var(--text-primary); border-radius: 12px; display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px;"
             >
               <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px;">
-                <span style="font-weight: 600; font-size: 13px;">{session.title || session.lastUserMessage || 'Untitled session'}</span>
+                {#if editingAiSessionId === session.id}
+                  <input
+                    type="text"
+                    bind:value={editingAiSessionTitle}
+                    style="flex: 1; min-width: 0; border: 1px solid var(--border-subtle); background: var(--bg-base); color: var(--text-primary); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 13px;"
+                    onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') void commitAiSessionRename(); if (e.key === 'Escape') cancelAiSessionRename(); e.stopPropagation(); }}
+                    onblur={() => void commitAiSessionRename()}
+                    onclick={(e: MouseEvent) => e.stopPropagation()}
+                    use:autoFocusSelect
+                  />
+                {:else}
+                  <button
+                    type="button"
+                    style="font-weight: 600; font-size: 13px; color: inherit; background: transparent; border: 0; padding: 0; text-align: left; cursor: text;"
+                    onclick={() => startAiSessionRename(session)}
+                  >{getAiSessionDisplayTitle(session)}</button>
+                {/if}
                 <span style="font-size: 11px; color: var(--text-muted); white-space: nowrap;">{session.updated_at}</span>
               </div>
               {#if session.lastUserMessage}
@@ -3854,9 +4761,40 @@
               {/if}
               <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text-muted);">
                 <span>{session.model}</span>
-                <span>{session.messageCount} turns</span>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                  <span>{session.messageCount} turns</span>
+                </div>
               </div>
-            </button>
+              <div style="display: flex; align-items: center; justify-content: flex-end; gap: 8px;">
+                <button
+                  type="button"
+                  class="ai-action-btn"
+                  style="padding: 6px 10px; font-size: 11px;"
+                  onclick={() => resumeAiSession(session)}
+                  disabled={deletingAiSessionId === session.id}
+                >
+                  Load
+                </button>
+                <button
+                  type="button"
+                  class="ai-action-btn"
+                  style="padding: 6px 10px; font-size: 11px;"
+                  onclick={() => startAiSessionRename(session)}
+                  disabled={deletingAiSessionId === session.id || editingAiSessionId === session.id}
+                >
+                  Rename
+                </button>
+                <button
+                  type="button"
+                  class="ai-action-btn"
+                  style="padding: 6px 10px; font-size: 11px; color: var(--term-red); border-color: color-mix(in srgb, var(--term-red) 35%, var(--border-subtle));"
+                  onclick={() => deleteAiSession(session)}
+                  disabled={deletingAiSessionId === session.id}
+                >
+                  {deletingAiSessionId === session.id ? 'Deleting...' : 'Delete'}
+                </button>
+              </div>
+            </div>
           {/each}
         {/if}
       </div>
@@ -3930,10 +4868,14 @@
           sshSessions={sshSessions}
           savedCommands={savedCommands}
           mcpServers={mcpServers}
+          {providerApiKeys}
+          aiProviders={AI_PROVIDERS}
           onSaveSettings={saveSettings}
           onRevokeCredentials={revokeCredentials}
           onSaveGeminiKey={saveGeminiKey}
           onRevokeGeminiKey={revokeGeminiKey}
+          onSaveProviderKey={saveProviderKey}
+          onRevokeProviderKey={revokeProviderKey}
           onSaveTheme={saveThemeToStore}
           onAddSshSession={addSshSession}
           onRemoveSshSession={removeSshSession}
@@ -4282,8 +5224,37 @@
                                 {/if}
                               </div>
                               <div class="ai-thread-answer-text markdown-body">{@html renderAiAnswer(block.response)}</div>
+                              {#if block.generatedImage}
+                                <div class="ai-generated-image">
+                                  <button class="ai-generated-image-preview" onclick={() => {
+                                    if (block.generatedImage) {
+                                      previewUrl = `data:${block.generatedImage.mimeType};base64,${block.generatedImage.data}`;
+                                      previewFileName = 'Generated Image';
+                                      rightPane = 'preview';
+                                    }
+                                  }} title="View full size">
+                                    <img src={`data:${block.generatedImage.mimeType};base64,${block.generatedImage.data}`} alt="Generated image" />
+                                  </button>
+                                  <button class="ai-action-btn ai-generated-image-download" onclick={() => {
+                                    if (!block.generatedImage) return;
+                                    const byteChars = atob(block.generatedImage.data);
+                                    const byteArray = new Uint8Array(byteChars.length);
+                                    for (let i = 0; i < byteChars.length; i++) byteArray[i] = byteChars.charCodeAt(i);
+                                    const blob = new Blob([byteArray], { type: block.generatedImage.mimeType });
+                                    const url = URL.createObjectURL(blob);
+                                    const ext = block.generatedImage.mimeType.split('/')[1] || 'png';
+                                    const a = document.createElement('a');
+                                    a.href = url;
+                                    a.download = `drover-image-${Date.now()}.${ext}`;
+                                    a.click();
+                                    URL.revokeObjectURL(url);
+                                  }}>
+                                    <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                    Download
+                                  </button>
+                                </div>
+                              {/if}
                             </div>
-                          {:else if block.phase === 'executing' || block.phase === 'retrying'}
                             <!-- handled by status above or commands section -->
                           {:else if block.phase === 'done'}
                             <div class="ai-thread-answer ai-thread-answer-done">
@@ -4297,7 +5268,7 @@
                                   <div class="ai-thread-answer-meta">{getAiExecutedCount(block)} step{getAiExecutedCount(block) > 1 ? 's' : ''}</div>
                                 {/if}
                               </div>
-                              <div class="ai-thread-answer-text ai-thread-answer-text-muted">Commands executed successfully.</div>
+                              <div class="ai-thread-answer-text ai-thread-answer-text-muted">{buildExecutionSummary(block)}</div>
                             </div>
                           {/if}
                         {/if}
@@ -4447,7 +5418,7 @@
                           <button class="mode-switch-btn" class:active={!agenticMode} onclick={() => { agenticMode = false; pendingCommand = ''; }} title="Terminal mode" aria-label="Terminal mode">
                             Terminal
                           </button>
-                          <button class="mode-switch-btn" class:active={agenticMode} onclick={async () => { if (!aiAccountId || !aiApiToken) { openSettings(); return; } agenticMode = true; pendingCommand = ''; await refreshAiSessions(); }} title="AI mode" aria-label="AI mode">
+                          <button class="mode-switch-btn" class:active={agenticMode} onclick={async () => { if (!isAnyProviderConfigured()) { openSettings(); return; } agenticMode = true; pendingCommand = ''; if (aiAccountId && aiApiToken) { await refreshKuratchiModels(); await refreshAiSessions(); } }} title="AI mode" aria-label="AI mode">
                             Agent
                           </button>
                         </div>
@@ -4461,49 +5432,55 @@
                           </button>
                           <!-- AI Model Selector -->
                           <div class="tools-dropdown-wrapper">
-                            <button class="ai-model-selector-btn" class:active={aiModelDropdownOpen} onclick={(e) => { e.stopPropagation(); aiModelDropdownOpen = !aiModelDropdownOpen; toolsDropdownOpen = false; sshDropdownOpen = false; }} title="Select AI model" aria-label="Select AI model">
+                            <button class="ai-model-selector-btn" class:active={aiModelDropdownOpen} onclick={(e) => { e.stopPropagation(); aiModelDropdownOpen = !aiModelDropdownOpen; toolsDropdownOpen = false; sshDropdownOpen = false; if (aiModelDropdownOpen) modelSearchQuery = ''; }} title="Select AI model" aria-label="Select AI model">
                               <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M12 1v6m0 6v6M5.64 5.64l4.24 4.24m4.24 4.24l4.24 4.24M1 12h6m6 0h6M5.64 18.36l4.24-4.24m4.24-4.24l4.24-4.24"></path></svg>
                               <span class="ai-model-selector-text">{getSelectedModelName()}</span>
                               <svg viewBox="0 0 24 24" width="10" height="10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
                             </button>
                             {#if aiModelDropdownOpen}
                               <div class="ai-model-dropdown">
-                                <div class="ai-model-dropdown-header">Cloudflare</div>
-                                {#each AI_MODELS.filter(m => m.provider === 'cloudflare') as model}
-                                  <button
-                                    class="ai-model-item"
-                                    class:active={selectedAiModel === model.id}
-                                    class:disabled={!aiApiToken}
-                                    onclick={() => { if (aiApiToken) selectAiModel(model.id); }}
-                                    title={!aiApiToken ? 'Configure Kuratchi API in Settings' : ''}
-                                  >
-                                    <div class="ai-model-name">{model.name}</div>
-                                    <div class="ai-model-desc">{model.description}</div>
-                                    {#if selectedAiModel === model.id}
-                                      <svg class="ai-model-check" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                <div class="ai-model-dropdown-search-container">
+                                  <input 
+                                    type="text" 
+                                    class="ai-model-dropdown-search" 
+                                    bind:value={modelSearchQuery} 
+                                    placeholder="Search models..." 
+                                    onclick={(e) => e.stopPropagation()} 
+                                    onkeydown={(e) => e.stopPropagation()}
+                                    use:autoFocusSelect
+                                  />
+                                </div>
+                                <div class="ai-model-dropdown-list">
+                                  {#each AI_PROVIDERS as prov, index}
+                                    {@const provModels = getAllAiModels().filter(m => m.provider === prov.id && (!modelSearchQuery || m.name.toLowerCase().includes(modelSearchQuery.toLowerCase()) || m.id.toLowerCase().includes(modelSearchQuery.toLowerCase())))}
+                                    {#if provModels.length > 0}
+                                      <div class="ai-model-dropdown-header" style:margin-top={index > 0 ? '4px' : '0'}>{prov.name}</div>
+                                      {#each provModels as model}
+                                        {@const enabled = isProviderConfigured(prov.id)}
+                                        <button
+                                          class="ai-model-item"
+                                          class:active={selectedAiModel === model.id}
+                                          class:disabled={!enabled}
+                                          onclick={() => { if (enabled) selectAiModel(model.id); }}
+                                          title={!enabled ? `Configure ${prov.name} in Settings` : ''}
+                                        >
+                                          <div class="ai-model-name">{model.name}</div>
+                                          <div class="ai-model-desc">{model.description}</div>
+                                          {#if selectedAiModel === model.id}
+                                            <svg class="ai-model-check" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                          {/if}
+                                        </button>
+                                      {/each}
                                     {/if}
-                                  </button>
-                                {/each}
-                                <div class="ai-model-dropdown-header" style="margin-top: 4px;">Google Gemini</div>
-                                {#each AI_MODELS.filter(m => m.provider === 'gemini') as model}
-                                  <button
-                                    class="ai-model-item"
-                                    class:active={selectedAiModel === model.id}
-                                    class:disabled={!geminiApiKey}
-                                    onclick={() => { if (geminiApiKey) selectAiModel(model.id); }}
-                                    title={!geminiApiKey ? 'Configure Gemini API key in Settings' : ''}
-                                  >
-                                    <div class="ai-model-name">{model.name}</div>
-                                    <div class="ai-model-desc">{model.description}</div>
-                                    {#if selectedAiModel === model.id}
-                                      <svg class="ai-model-check" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                    {/if}
-                                  </button>
-                                {/each}
+                                  {/each}
+                                  {#if getAllAiModels().filter(m => !modelSearchQuery || m.name.toLowerCase().includes(modelSearchQuery.toLowerCase()) || m.id.toLowerCase().includes(modelSearchQuery.toLowerCase())).length === 0}
+                                    <div style="padding: 16px; text-align: center; color: #666; font-size: 12px;">No models found</div>
+                                  {/if}
+                                </div>
                               </div>
                             {/if}
                           </div>
-                          <button class="toolbar-text-btn" class:active={aiSessionsSidebarOpen} onclick={async () => { aiSessionsSidebarOpen = !aiSessionsSidebarOpen; aiModelDropdownOpen = false; toolsDropdownOpen = false; sshDropdownOpen = false; if (aiSessionsSidebarOpen) await refreshAiSessions(); }} title="Recent AI sessions" aria-label="Recent AI sessions">
+                          <button class="toolbar-text-btn" class:active={aiSessionsSidebarOpen} onclick={async () => { aiSessionsSidebarOpen = !aiSessionsSidebarOpen; aiModelDropdownOpen = false; toolsDropdownOpen = false; sshDropdownOpen = false; if (aiSessionsSidebarOpen) { await refreshKuratchiModels(); await refreshAiSessions(); } }} title="Recent AI sessions" aria-label="Recent AI sessions">
                             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
                             <span>Sessions</span>
                           </button>
@@ -4840,6 +5817,24 @@
         <span>Drover v0.1.0</span>
       </div>
     </footer>
+
+    {#if liveInterruptDialogOpen && liveInterruptDraft}
+      <div style="position: absolute; inset: 0; background: rgba(7, 8, 12, 0.62); display: flex; align-items: center; justify-content: center; z-index: 80;" onclick={dismissLiveInterruptDialog}>
+        <div style="width: min(520px, calc(100vw - 32px)); background: color-mix(in srgb, var(--bg-elevated) 94%, black); border: 1px solid var(--border-subtle); border-radius: 16px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45); padding: 18px;" onclick={(event) => event.stopPropagation()}>
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted);">Interrupt current response?</div>
+          <div style="font-size: 18px; font-weight: 600; color: var(--text-primary); margin-top: 8px;">Drover is still answering</div>
+          <div style="font-size: 14px; color: var(--text-secondary); margin-top: 8px; line-height: 1.5;">
+            Choose whether this new prompt should steer the current turn or start a fresh turn after stopping the current reply.
+          </div>
+          <div style="margin-top: 14px; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border-subtle); background: color-mix(in srgb, var(--bg-base) 78%, black); color: var(--text-primary); font-size: 13px; line-height: 1.5; white-space: pre-wrap;">{liveInterruptDraft.prompt}</div>
+          <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;">
+            <button class="ai-action-btn ai-action-btn-muted" onclick={dismissLiveInterruptDialog}>Keep waiting</button>
+            <button class="ai-action-btn" onclick={() => resolveLiveInterrupt('steer')}>Steer response</button>
+            <button class="ai-action-btn ai-action-btn-primary" onclick={() => resolveLiveInterrupt('send')}>Send anyway</button>
+          </div>
+        </div>
+      </div>
+    {/if}
   </div>
 </div>
 
